@@ -20,7 +20,14 @@ class Mcp23017Driver {
 public:
     static Mcp23017Driver &instance();
 
-    bool init();                       // Wire.begin + проверка чипа + настройка портов
+    bool init();                       // I2C-мастер + проверка чипа + настройка портов
+
+    // Нативный ESP-IDF I2C мастер (driver/i2c.h) — тот же путь, что в
+    // эталонном esp-idf-примере MCP23017. Wire/NG-драйвер не используется:
+    // его стартовый фиктивный START+STOP ломал транзакции к регистрам.
+    bool ensureNativeBus();            // идемпотентная инициализация порта
+    static constexpr uint8_t I2C_PORT_DEFAULT = 1; // используем порт 1 (Wire — порт 0)
+
     bool isReady() const { return ready_; }
 
     bool write(McpPin pin, bool high); // установить прямой уровень пина (read-modify-write OLATx)
@@ -49,6 +56,7 @@ public:
 private:
     Mcp23017Driver() = default;
     bool ready_ = false;
+    bool nativeReady_ = false; // нативный I2C-мастер (driver/i2c.h) создан
     void *lock_ = nullptr; // SemaphoreHandle_t (не раскрываем FreeRTOS в заголовке)
 
     // Дебаунс порта B: сырое значение, стабилизированное значение, время изменения
