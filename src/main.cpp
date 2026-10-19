@@ -27,6 +27,9 @@
 #include "rs485_config.h"
 #include "fs_driver.h"
 #include "freertos_task.h"
+#include "wifi_manager.h"
+#include "config_service.h"
+#include "web_server.h"
 
 // Прототипы вспомогательных функций уровня приложения (определения ниже)
 
@@ -84,6 +87,8 @@ protected:
                     lastLoggedDi = di;
                     lastLoggedDo = g_doState;
                 }
+                // Снимок для веб-интерфейса (вкладка "Входы / Выходы")
+                web::setDiDo(g_diState, g_doState, hal::mcpIsReady());
             }
             delayMs(DI_POLL_INTERVAL_MS);
         }
@@ -253,7 +258,26 @@ void setup() {
         LOGP("[WARN] LittleFS mount failed\n");
     } else {
         fs::FsDriver::instance().mkdir("/log");
+        fs::FsDriver::instance().mkdir("/www");   // каталог файлов веб-интерфейса
     }
+
+    // 2a. Wi-Fi: настройки из NVS (ConfigService); при пустом SSID или неудаче —
+    //     точка доступа KOTELPC-AP / 12345678 (http://192.168.4.1/).
+    {
+        ConfigService svc;
+        DeviceConfig cfg;
+        if (!svc.load(cfg)) {
+            cfg.wifiSsid = DEFAULT_WIFI_SSID;
+            cfg.wifiPassword = DEFAULT_WIFI_PASSWORD;
+        }
+        g_wifi.begin(cfg.wifiSsid.c_str(), cfg.wifiPassword.c_str());
+        LOGP("[WIFI] mode=%s ssid=\"%s\" ip=%s\n",
+             g_wifi.isApMode() ? "AP" : "STA", g_wifi.currentSsid().c_str(),
+             g_wifi.localIP().c_str());
+    }
+
+    // 2b. Веб-интерфейс (порт 80): вкладки Сеть / Входы-Выходы / Файлы LittleFS
+    web::start();
 
     // 3. Прикладные FreeRTOS-задачи
     heartbeatTask.start(os::TaskBase::Config{"hb", 3072, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});

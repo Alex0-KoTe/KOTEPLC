@@ -2,6 +2,8 @@
 #include "project_config.h"
 #include <Arduino.h>
 
+WifiManager g_wifi;   // единый экземпляр менеджера для всего приложения
+
 void WifiManager::begin(const String &ssid, const String &password) {
     if (ssid.length() == 0) {
         startAccessPoint(AP_SSID, AP_PASSWORD);
@@ -11,6 +13,9 @@ void WifiManager::begin(const String &ssid, const String &password) {
     if (!isConnected()) {
         // Fallback: поднимаем точку доступа
         startAccessPoint(AP_SSID, AP_PASSWORD);
+    } else {
+        apMode_ = false;
+        ssid_ = ssid;
     }
 }
 
@@ -27,12 +32,14 @@ void WifiManager::connect(const String &ssid, const String &password, unsigned l
 void WifiManager::startAccessPoint(const String &ssid, const String &password) {
     WiFi.mode(WIFI_AP);
     WiFi.softAP(ssid.c_str(), password.c_str());
+    apMode_ = true;
+    ssid_ = ssid;
 }
 
 bool WifiManager::isConnected() const {
-    return WiFi.status() == WL_CONNECTED;
+    return apMode_ ? true : (WiFi.status() == WL_CONNECTED);
 }
 
 String WifiManager::localIP() const {
-    return WiFi.localIP().toString();
+    return apMode_ ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
 }
