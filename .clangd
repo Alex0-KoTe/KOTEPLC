@@ -1,0 +1,2 @@
+CompileFlags:
+  Add: [-Iinclude, -Ilib/drivers/include, -Ilib/fs/include, -Icomponents/freertos_task/include]

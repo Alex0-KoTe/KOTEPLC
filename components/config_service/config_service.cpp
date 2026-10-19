@@ -43,6 +43,6 @@ bool ConfigService::save(const DeviceConfig &cfg) {
 bool ConfigService::resetToDefaults(DeviceConfig &cfg) {
     cfg.wifiSsid = DEFAULT_WIFI_SSID;
     cfg.wifiPassword = DEFAULT_WIFI_PASSWORD;
-    cfg.pollIntervalMs = SENSOR_READ_INTERVAL_MS;
+    cfg.pollIntervalMs = HEARTBEAT_PERIOD_MS;
     return save(cfg);
 }

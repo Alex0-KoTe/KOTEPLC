@@ -12,14 +12,13 @@
 #define DEFAULT_WIFI_PASSWORD ""
 
 // Версия прошивки
-#define FW_VERSION "0.1.0"
+#define FW_VERSION "0.2.0"
 
-// Пин встроенного светодиода для индикации состояния
-#define STATUS_LED_PIN 2
-
-// Интервалы работы (мс)
-#define LOOP_DELAY_MS 10
-#define SENSOR_READ_INTERVAL_MS 1000
+// ---- FreeRTOS-периоды (мс) ----
+#define HEARTBEAT_PERIOD_MS   1000   // мигание статусным LED
+#define INPUT_POLL_INTERVAL_MS 20    // опрос кнопок/входов
+#define BUTTON_DEBOUNCE_MS     50    // дебаунс кнопки
+#define FS_LOG_INTERVAL_MS     1000  // запись в лог LittleFS
 
 // Настройки последовательного порта отладки
 #define SERIAL_BAUD_RATE 115200
