@@ -3,6 +3,9 @@
 #include "project_config.h"
 #include "gpio_config.h"
 #include "mcp23017_config.h"
+#include "rs485_config.h"
+#include "hal/hal_rs485.h"
+#include "driver_rs485.h"
 
 void test_gpio_config_valid(void) {
     // Компилируемая проверка таблицы пинов драйвера (включая резервирование
@@ -40,6 +43,44 @@ void test_mcp_pin_mapping(void) {
     TEST_ASSERT_EQUAL_UINT8(0x17, static_cast<uint8_t>(McpPin::DI7));
 }
 
+void test_rs485_pins(void) {
+    // IO1=TX, IO3=RX (UART), IO23=RE/DE направление передачи
+    TEST_ASSERT_EQUAL_INT(1, rs485_config::PIN_TX);
+    TEST_ASSERT_EQUAL_INT(3, rs485_config::PIN_RX);
+    TEST_ASSERT_EQUAL_INT(23, rs485_config::PIN_REDE);
+    // RE/DE зарезервирован в таблице GPIO-драйвера (не может быть назначен как GPIO)
+    bool found = false;
+    for (size_t i = 0; i < sizeof(kGpioConfig::kReservedPins) / sizeof(int); ++i) {
+        if (kGpioConfig::kReservedPins[i] == rs485_config::PIN_REDE) found = true;
+    }
+    TEST_ASSERT_TRUE(found);
+    TEST_ASSERT_TRUE(kGpioConfig::validate());
+}
+
+void test_modbus_crc16(void) {
+    // Эталонный кадр Modbus: запрос холдинг-регистра 0 слейва 1
+    const uint8_t req[] = {0x01, 0x03, 0x00, 0x00, 0x00, 0x01};
+    TEST_ASSERT_EQUAL_UINT16(0x0AC4, drv::Rs485Driver::crc16(req, sizeof(req)));
+    // Кадр ответа слейва 1: 01 03 02 00 0A + CRC
+    const uint8_t resp[] = {0x01, 0x03, 0x02, 0x00, 0x0A, 0xC4, 0x0B};
+    TEST_ASSERT_EQUAL_UINT16(
+        (uint16_t)resp[5] | ((uint16_t)resp[6] << 8),
+        drv::Rs485Driver::crc16(resp, 5));
+}
+
+void test_modbus_t35(void) {
+    // t3.5 при 19200 бод ~ 2 мс (минимум по спецификации), при 9600 ~ 5 мс
+    TEST_ASSERT_EQUAL_UINT32(2, rs485_config::modbusT35Ms(19200));
+    TEST_ASSERT_TRUE(rs485_config::modbusT35Ms(9600) >= 4);
+    TEST_ASSERT_TRUE(rs485_config::modbusT35Ms(115200) >= 2);
+}
+
+void test_rs_mode_switch_values(void) {
+    // Значения режима стабильны (используются в NVS/протоколе)
+    TEST_ASSERT_EQUAL_UINT8(0, static_cast<uint8_t>(RsMode::SIMPLE_UART));
+    TEST_ASSERT_EQUAL_UINT8(1, static_cast<uint8_t>(RsMode::MODBUS_RTU));
+}
+
 void test_fw_version_not_empty(void) {
     TEST_ASSERT_NOT_NULL(FW_VERSION);
     TEST_ASSERT_GREATER_THAN_UINT32(0, strlen(FW_VERSION));
@@ -57,6 +98,10 @@ void setup() {
     RUN_TEST(test_mcp_i2c_pins);
     RUN_TEST(test_mcp_port_directions);
     RUN_TEST(test_mcp_pin_mapping);
+    RUN_TEST(test_rs485_pins);
+    RUN_TEST(test_modbus_crc16);
+    RUN_TEST(test_modbus_t35);
+    RUN_TEST(test_rs_mode_switch_values);
     RUN_TEST(test_fw_version_not_empty);
     UNITY_END();
 }

@@ -14,8 +14,9 @@
 //   IO21 -> SDA  шины I2C к MCP23017 (назначается в mcp23017_config.h)
 //   IO22 -> SCL  шины I2C к MCP23017 (назначается в mcp23017_config.h)
 //   IO16 -> HEART pulse LED (мигает, показывая, что прошивка жива)
-//   IO1  -> UART0 TX (отладочный Serial; на кастомных платах можно переназначить)
-//   IO3  -> UART0 RX (загрубочный/прошивочный пин — использовать осторожно)
+//   IO1  -> UART TX (DI транслятора RS485; конфигурация — rs485_config.h)
+//   IO3  -> UART RX (RO транслятора RS485; загрубочный пин — осторожно)
+//   IO23 -> RE/DE направления передачи RS485 (конфигурация — rs485_config.h)
 // ============================================================================
 
 // Логические имена сигналов (не зависят от физических номеров пинов)
@@ -46,8 +47,9 @@ constexpr GpioSignalConfig table[kCount] = {
 constexpr int kReservedPins[] = {
     21, // SDA  (MCP23017, mcp_config::SDA_PIN)
     22, // SCL  (MCP23017, mcp_config::SCL_PIN)
-    1,  // UART0 TX
-    3,  // UART0 RX
+    1,  // UART TX  (RS485, rs485_config::PIN_TX)
+    3,  // UART RX  (RS485, rs485_config::PIN_RX)
+    23, // RE/DE    (RS485, rs485_config::PIN_REDE)
 };
 
 constexpr bool validate() {

@@ -26,4 +26,13 @@
 // Настройки последовательного порта отладки
 #define SERIAL_BAUD_RATE 115200
 
+// ---- Канал RS485 (конфигурация пинов — в драйвере, rs485_config.h) ----
+// Стартовый режим канала: 0 = SIMPLE_UART (текстовые команды), 1 = MODBUS_RTU.
+// Переключить на лету можно командой "mode modbus"/"mode uart" из шины.
+#define RS485_START_MODBUS        0
+// Таймаут ожидания ответа/кадра Modbus, мс
+#define MODBUS_RESP_TIMEOUT_MS    500
+// Куда идут логи/ввод после старта: 0 = Serial (отладка), 1 = шина RS485
+#define UART_BRIDGE_TO_RS485      0
+
 #endif // PROJECT_CONFIG_H
