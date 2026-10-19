@@ -78,23 +78,58 @@ bool Mcp23017Driver::readReg(uint8_t addr, uint8_t &value) {
     return true;
 }
 
+bool Mcp23017Driver::probeBus(uint8_t addr) {
+    Wire.beginTransmission(addr);
+    return Wire.endTransmission() == 0; // ACK от чипа => устройство на месте
+}
+
 bool Mcp23017Driver::init() {
-    if (!Wire.begin(mcp_config::SDA_PIN, mcp_config::SCL_PIN, mcp_config::CLOCK_HZ)) {
-        ESP_LOGE(MCP_TAG, "I2C bus init failed (sda=%u scl=%u)",
-                 mcp_config::SDA_PIN, mcp_config::SCL_PIN);
-        return false;
+    // Первичная инициализация шины (idempotent), затем диагностика линии SDA:
+    // если линия «залипла» в низком уровне (нет подтяжек / чип не в POR),
+    // генерируем до 9 тактов SCL — стандартная процедура I2C bus recovery.
+    Wire.begin(mcp_config::SDA_PIN, mcp_config::SCL_PIN, mcp_config::CLOCK_HZ);
+
+    if (digitalRead(mcp_config::SDA_PIN) == LOW) {
+        ESP_LOGW(MCP_TAG, "SDA stuck LOW, trying clock recovery (9x SCL)");
+        pinMode(mcp_config::SCL_PIN, OUTPUT);
+        for (int i = 0; i < 9 && digitalRead(mcp_config::SDA_PIN) == LOW; ++i) {
+            digitalWrite(mcp_config::SCL_PIN, HIGH);
+            delayMicroseconds(5);
+            digitalWrite(mcp_config::SCL_PIN, LOW);
+            delayMicroseconds(5);
+        }
+        digitalWrite(mcp_config::SCL_PIN, HIGH);
+        delayMicroseconds(5);
+        // реконфигурируем шину после «ручного» режима
+        Wire.begin(mcp_config::SDA_PIN, mcp_config::SCL_PIN, mcp_config::CLOCK_HZ);
     }
 
-    // Проверка присутствия чипа: запись IOCON должна подтвердиться ACK'ом
+    // Проверка присутствия чипа: адрес должен ответить ACK'ом
     if (!ensureLock()) return false;
-    const bool present = writeReg(reg::IOCONA, 0x00) && [&] {
-        uint8_t v = 0xFF;
-        return readReg(reg::IOCONA, v) && v == 0x00;
-    }();
+    const bool acked = probeBus(mcp_config::I2C_ADDR);
+    bool present = false;
+    if (acked) {
+        // Дополнительная проверка регистровой модели: запись IOCON должна считаться обратно
+        present = writeReg(reg::IOCONA, 0x00) && [&] {
+            uint8_t v = 0xFF;
+            return readReg(reg::IOCONA, v) && v == 0x00;
+        }();
+    }
     releaseLock();
 
     if (!present) {
-        ESP_LOGE(MCP_TAG, "chip not found at 0x%02X", mcp_config::I2C_ADDR);
+        // Диагностика: сканируем шину 0x20..0x27 и выводим все найденные адреса
+        char found[64] = "";
+        size_t pos = 0;
+        for (uint8_t a = 0x20; a <= 0x27 && pos < sizeof(found) - 8; ++a) {
+            if (probeBus(a)) {
+                pos += snprintf(found + pos, sizeof(found) - pos, "0x%02X ", a);
+            }
+        }
+        ESP_LOGE(MCP_TAG, "chip not found at 0x%02X%s%s",
+                 mcp_config::I2C_ADDR,
+                 found[0] ? " | devices on bus: " : " | no devices responded on scan (check power/pull-ups/wiring)",
+                 found);
         return false;
     }
 

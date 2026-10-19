@@ -52,6 +52,7 @@ private:
     void releaseLock();
     bool writeReg(uint8_t addr, uint8_t value);
     bool readReg(uint8_t addr, uint8_t &value);
+    static bool probeBus(uint8_t addr);   // ACK-опрос адреса на шине
     static uint8_t portOf(McpPin pin);
     static uint8_t bitOf(McpPin pin);
 };

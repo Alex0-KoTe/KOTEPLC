@@ -238,11 +238,24 @@ void setup() {
     LOGP("[PWR] PERIPH_EN (IO4) = 1, periphery power on\n");
 
     // 1b. Расширитель GPIO MCP23017 по I2C (шина/адрес/порты — в mcp23017_config.h)
-    if (hal::mcpInit()) {
-        LOGP("[MCP] MCP23017 online @0x%02X (sda=%d scl=%d)\n",
-             mcp_config::I2C_ADDR, mcp_config::SDA_PIN, mcp_config::SCL_PIN);
-    } else {
-        LOGP("[WARN] MCP23017 not present on I2C bus\n");
+    //     Инициализация с повторными попытками: чипу после включения питания
+    //     по PERIPH_EN нужно время на POR; шина при этом опрашивается заново.
+    bool mcpOnline = false;
+    for (int attempt = 1; attempt <= MCP_INIT_RETRIES && !mcpOnline; ++attempt) {
+        if (hal::mcpInit()) {
+            mcpOnline = true;
+            LOGP("[MCP] MCP23017 online @0x%02X (sda=%d scl=%d), attempt %d\n",
+                 mcp_config::I2C_ADDR, mcp_config::SDA_PIN, mcp_config::SCL_PIN, attempt);
+        } else {
+            LOGP("[MCP] init attempt %d/%d failed, retry in %d ms\n",
+                 attempt, MCP_INIT_RETRIES, MCP_INIT_RETRY_DELAY_MS);
+            delay(MCP_INIT_RETRY_DELAY_MS);
+        }
+    }
+    if (!mcpOnline) {
+        LOGP("[ERROR] MCP23017 не найден на шине I2C (адрес 0x20, ADDR=GND).\n"
+             "        Проверьте: питание периферии (IO4), SDA=IO21/SCL=IO22,\n"
+             "        подтяжки к +3V3, монтаж микросхемы.\n");
     }
 
     // 1c. Канал RS485: UART + RE/DE (конфигурация — rs485_config.h).
