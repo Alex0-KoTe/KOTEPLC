@@ -123,7 +123,7 @@ bool Mcp23017Driver::init() {
     return true;
 }
 
-bool Mcp23017Driver::isValid(McpPin pin) const {
+bool Mcp23017Driver::isValid(McpPin pin) {
     const auto v = static_cast<uint8_t>(pin);
     return v <= 0x07 || (v >= 0x10 && v <= 0x17);
 }

@@ -1,6 +1,7 @@
 #include "config_service.h"
 #include <Preferences.h>
 #include <Arduino.h>
+#include "project_config.h"
 
 bool ConfigService::load(DeviceConfig &cfg) {
     Preferences prefs;

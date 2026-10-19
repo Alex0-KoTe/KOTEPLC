@@ -42,7 +42,7 @@ bool FsDriver::begin(bool allowFormat) {
     if (mounted_) return true;
 
     const esp_partition_t *part = esp_partition_find_first(
-        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_ANY, "storage");
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "storage");
     if (!part) {
         ESP_LOGE(TAG, "partition 'storage' not found (check partitions.csv)");
         return false;
@@ -110,7 +110,7 @@ bool FsDriver::appendFile(const std::string &path, const std::string &data) {
 
 bool FsDriver::exists(const std::string &path) {
     struct stat st;
-    return stat(fullPath(path).c_str(), &st) == 0;
+    return ::stat(fullPath(path).c_str(), &st) == 0;
 }
 
 bool FsDriver::remove(const std::string &path) {
