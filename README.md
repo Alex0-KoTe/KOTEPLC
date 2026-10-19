@@ -11,7 +11,7 @@
         │
 HAL (include/hal)                     hal::gpioRead/Write(логический пин)
         │
-Драйверы (lib/drivers, lib/fs)        GpioDriver (ESP-IDF driver/gpio), FsDriver (esp_littlefs)
+Драйверы (lib/drivers, lib/fs)        GpioDriver (ESP-IDF driver/gpio), FsDriver (joltwallet/esp_littlefs v1.14.8)
         │
 Железо                                GPIO-пины, SPI Flash (раздел "storage")
 ```
