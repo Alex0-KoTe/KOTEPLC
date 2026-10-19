@@ -221,17 +221,26 @@ void setup() {
     LOGP("Chip: %s, rev %d, cores %d, freq %d MHz\n",
          ESP.getChipModel(), ESP.getChipRevision(),
          ESP.getChipCores(), ESP.getCpuFreqMHz());
-    LOGP("Pins: IO16=HEART LED, IO1=RS485 TX, IO3=RS485 RX, IO23=RE/DE, "
-         "IO21=SDA, IO22=SCL -> MCP23017 (GPA=RL0..RL7, GPB=DI0..DI7)\n");
+    LOGP("Pins: IO16=HEART LED(active LOW), IO4=PERIPH_EN, IO1=RS485 TX, "
+         "IO3=RS485 RX, IO23=RE/DE, "
+         "IO21=SDA, IO22=SCL -> MCP23017 @0x20 (ADDR=GND), "
+         "GPA=RL0..RL7, GPB=DI0..DI7\n");
 
     // 1. Драйверы железа (конфигурация пинов — внутри драйвера)
     if (!hal::gpioInit()) {
         LOGP("[FATAL] GPIO driver init failed\n");
     }
 
+    // 1a. Питание периферии: подаём логическую 1 на IO4 (PERIPH_EN),
+    //     ждём стабилизации питания MCP23017/реле/RS485 перед их инициализацией.
+    hal::gpioWrite(static_cast<int>(GpioPin::PERIPH_EN), true);
+    delay(PERIPH_POWER_STABLE_MS);
+    LOGP("[PWR] PERIPH_EN (IO4) = 1, periphery power on\n");
+
     // 1b. Расширитель GPIO MCP23017 по I2C (шина/адрес/порты — в mcp23017_config.h)
     if (hal::mcpInit()) {
-        LOGP("[MCP] MCP23017 online @0x20 (sda=21 scl=22)\n");
+        LOGP("[MCP] MCP23017 online @0x%02X (sda=%d scl=%d)\n",
+             mcp_config::I2C_ADDR, mcp_config::SDA_PIN, mcp_config::SCL_PIN);
     } else {
         LOGP("[WARN] MCP23017 not present on I2C bus\n");
     }

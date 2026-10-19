@@ -13,7 +13,9 @@
 // Карта железа KOTELPC:
 //   IO21 -> SDA  шины I2C к MCP23017 (назначается в mcp23017_config.h)
 //   IO22 -> SCL  шины I2C к MCP23017 (назначается в mcp23017_config.h)
-//   IO16 -> HEART pulse LED (мигает, показывая, что прошивка жива)
+//   IO16 -> HEART pulse LED (включается подачей LOGIC 0 — activeLow)
+//   IO4  -> PERIPH_EN: логическая 1 включает питание всей периферии
+//           (MCP23017, реле, RS485) после старта программы
 //   IO1  -> UART TX (DI транслятора RS485; конфигурация — rs485_config.h)
 //   IO3  -> UART RX (RO транслятора RS485; загрубочный пин — осторожно)
 //   IO23 -> RE/DE направления передачи RS485 (конфигурация — rs485_config.h)
@@ -21,7 +23,8 @@
 
 // Логические имена сигналов (не зависят от физических номеров пинов)
 enum class GpioPin : uint8_t {
-    LED_HEART,        // индикатор «сердцебиения» (heartbeat pulse LED)
+    LED_HEART,        // индикатор «сердцебиения» (LED горит при LOW на IO16)
+    PERIPH_EN,        // разрешение питания периферии (LOGIC 1 = включено)
     PIN_COUNT
 };
 
@@ -40,7 +43,8 @@ constexpr int kCount = static_cast<int>(GpioPin::PIN_COUNT);
 // Реле (RL0..RL7) и дискретные входы (DI0..DI7) висят на MCP23017
 // и описаны в mcp23017_config.h, здесь их нет.
 constexpr GpioSignalConfig table[kCount] = {
-    /* LED_HEART */ { GPIO_NUM_16, HalGpioMode::OUTPUT_MODE, false, false },
+    /* LED_HEART  */ { GPIO_NUM_16, HalGpioMode::OUTPUT_MODE, true,  false }, // LED горит при LOW (activeLow)
+    /* PERIPH_EN  */ { GPIO_NUM_4,  HalGpioMode::OUTPUT_MODE, false, false }, // старт: периферия обесточена, включим после gpioInit()
 };
 
 // Пины, занятые под другие функции (I2C/UART) — не должны попадать в таблицу.

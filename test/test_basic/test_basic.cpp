@@ -19,11 +19,26 @@ void test_heart_led_is_output_io16(void) {
     TEST_ASSERT_EQUAL_INT(GPIO_NUM_16, static_cast<int>(cfg.pin));
     TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(HalGpioMode::OUTPUT_MODE),
                             static_cast<uint8_t>(cfg.mode));
+    // LED включается подачей логического 0 на IO16 => activeLow
+    TEST_ASSERT_TRUE(cfg.activeLow);
+}
+
+void test_periph_en_is_output_io4(void) {
+    const auto &cfg = kGpioConfig::table[static_cast<int>(GpioPin::PERIPH_EN)];
+    TEST_ASSERT_EQUAL_INT(GPIO_NUM_4, static_cast<int>(cfg.pin));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(HalGpioMode::OUTPUT_MODE),
+                            static_cast<uint8_t>(cfg.mode));
+    // Логическая 1 на IO4 включает питание периферии (activeHigh)
+    TEST_ASSERT_FALSE(cfg.activeLow);
+    // На старте (gpioInit) периферия обесточена — включение после старта
+    TEST_ASSERT_FALSE(cfg.initialHigh);
 }
 
 void test_mcp_i2c_pins(void) {
     TEST_ASSERT_EQUAL_UINT8(21, mcp_config::SDA_PIN);
     TEST_ASSERT_EQUAL_UINT8(22, mcp_config::SCL_PIN);
+    // Все пины ADDR (A2 A1 A0) притянуты к минусу -> адрес 0x20
+    TEST_ASSERT_EQUAL_UINT8(0x20, mcp_config::I2C_ADDR);
 }
 
 void test_mcp_port_directions(void) {
@@ -95,6 +110,7 @@ void setup() {
     UNITY_BEGIN();
     RUN_TEST(test_gpio_config_valid);
     RUN_TEST(test_heart_led_is_output_io16);
+    RUN_TEST(test_periph_en_is_output_io4);
     RUN_TEST(test_mcp_i2c_pins);
     RUN_TEST(test_mcp_port_directions);
     RUN_TEST(test_mcp_pin_mapping);
