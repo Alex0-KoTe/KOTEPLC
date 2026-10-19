@@ -28,29 +28,29 @@ struct GpioSignalConfig {
     bool initialHigh;    // начальное состояние выхода (учитывает activeLow)
 };
 
-namespace gpio_config {
+namespace kGpioConfig {
 
-inline constexpr int kCount = static_cast<int>(GpioPin::PIN_COUNT);
+constexpr int kCount = static_cast<int>(GpioPin::PIN_COUNT);
 
 // Таблица конфигурации. Индекс = порядковый номер GpioPin.
 // Пины 34..39 — input-only (подтяжки недоступны на 34/35).
 constexpr GpioSignalConfig table[kCount] = {
-    /* LED_STATUS */ { GPIO_NUM_2,  HalGpioMode::OUTPUT,       false, false },
-    /* RELAY_1    */ { GPIO_NUM_26, HalGpioMode::OUTPUT,       false, false },
-    /* RELAY_2    */ { GPIO_NUM_27, HalGpioMode::OUTPUT,       false, false },
-    /* BTN_1      */ { GPIO_NUM_33, HalGpioMode::INPUT_PULLUP, true,  false },
-    /* SENSOR_1   */ { GPIO_NUM_32, HalGpioMode::INPUT_PULLUP, false, false },
+    /* LED_STATUS */ { GPIO_NUM_2,  HalGpioMode::OUTPUT_MODE,       false, false },
+    /* RELAY_1    */ { GPIO_NUM_26, HalGpioMode::OUTPUT_MODE,       false, false },
+    /* RELAY_2    */ { GPIO_NUM_27, HalGpioMode::OUTPUT_MODE,       false, false },
+    /* BTN_1      */ { GPIO_NUM_33, HalGpioMode::INPUT_PULLUP_MODE, true,  false },
+    /* SENSOR_1   */ { GPIO_NUM_32, HalGpioMode::INPUT_PULLUP_MODE, false, false },
 };
 
-consteval bool validate() {
+constexpr bool validate() {
     for (int i = 0; i < kCount; ++i) {
         const auto &c = table[i];
         const int p = static_cast<int>(c.pin);
         if (p < 0 || p > 39) return false;
         const bool isInput =
-            c.mode == HalGpioMode::INPUT ||
-            c.mode == HalGpioMode::INPUT_PULLUP ||
-            c.mode == HalGpioMode::INPUT_PULLDOWN;
+            c.mode == HalGpioMode::INPUT_MODE ||
+            c.mode == HalGpioMode::INPUT_PULLUP_MODE ||
+            c.mode == HalGpioMode::INPUT_PULLDOWN_MODE;
         // выходы недоступны на input-only пинах 34..39
         if (!isInput && p >= 34 && p <= 39) return false;
         // strapped-пины 6..11 не используем как выходы нагрузки
@@ -61,6 +61,6 @@ consteval bool validate() {
 
 static_assert(validate(), "Invalid GPIO configuration in gpio_config.h");
 
-} // namespace gpio_config
+} // namespace kGpioConfig
 
 #endif // GPIO_CONFIG_H

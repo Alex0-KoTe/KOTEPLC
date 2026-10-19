@@ -41,9 +41,9 @@ HAL (include/hal)                     hal::gpioRead/Write(логический �
 │   │   ├── include/fs_driver.h
 │   │   └── fs_driver.cpp
 │   └── wifi/wifi_manager.cpp
-├── components/
 │   ├── config_service/         # NVS + JSON конфигурация
 │   └── freertos_task/include/freertos_task.h   # обёртка os::TaskBase
+├── deps/esp_littlefs/          # драйвер LittleFS v1.14.8 (+ littlefs v2.5.1), скачан в проект
 ├── test/test_basic/            # Unity-тесты (валидация таблицы пинов)
 └── data/                       # файлы для загрузки в LittleFS (pio run -t uploadfs)
 ```
