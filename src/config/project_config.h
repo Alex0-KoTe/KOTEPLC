@@ -21,7 +21,15 @@
 #define FS_LOG_INTERVAL_MS     1000  // запись в лог LittleFS
 #define MCP_POLL_INTERVAL_MS   100   // (резерв) период фоновых операций MCP
 #define DI_POLL_INTERVAL_MS    10    // опрос входов DI0..DI7 + дебаунс (мс)
-#define RELAY_TEST_INTERVAL_MS 500   // тестовая последовательность реле RL0..RL7 (мс)
+
+// ---- Однократный тест реле при старте (проверка железа) ----
+// Задача по очереди щёлкает всеми реле RL0..RL7 с частотой 2 Гц
+// (полупериод 250 мс на реле), затем выключает все и выдаёт в простой UART
+// сообщение "Тест реле пройден".
+#define RELAY_TEST_ENABLED      1
+#define RELAY_TEST_FREQ_HZ      2      // частота переключения, Гц
+#define RELAY_TEST_HALFPERIOD_MS (1000 / RELAY_TEST_FREQ_HZ / 2)  // 250 мс
+#define RELAY_TEST_START_DELAY_MS 2000 // задержка старта после инициализации железа
 
 // Настройки последовательного порта отладки
 #define SERIAL_BAUD_RATE 115200
