@@ -52,7 +52,10 @@ private:
     void releaseLock();
     bool writeReg(uint8_t addr, uint8_t value);
     bool readReg(uint8_t addr, uint8_t &value);
-    static bool probeBus(uint8_t addr);   // ACK-опрос адреса на шине
+    static bool probeBus(uint8_t addr);   // ACK-опрос адреса на шине (true = ACK)
+    static int  probeBusDetailed(uint8_t addr); // код endTransmission(): 0=ACK, 2=NACK, 4=timeout
+    static bool sdaStuckLow();            // проверка линии SDA через INPUT_PULLUP
+    static void recoverBus();             // 9 тактов SCL + STOP (I2C bus recovery)
     static uint8_t portOf(McpPin pin);
     static uint8_t bitOf(McpPin pin);
 };

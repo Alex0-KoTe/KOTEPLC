@@ -12,18 +12,21 @@
 #define DEFAULT_WIFI_PASSWORD ""
 
 // Версия прошивки
-#define FW_VERSION "0.3.2"
+#define FW_VERSION "0.3.3"
 
 // ---- Питание периферии ----
 // PERIPH_EN (IO4): логическая 1 включает питание всей периферии
 // (MCP23017, реле, RS485). Пауза до инициализации драйверов —
 // время стабилизации напряжения после подачи.
-#define PERIPH_POWER_STABLE_MS 100
+// Увеличено до 300 мс: при питании через ключ (IO4) ёмкости на нагрузке
+// заряжаются медленно, и MCP23017 может ещё не выйти из POR к моменту
+// первого обращения к шине.
+#define PERIPH_POWER_STABLE_MS 300
 
 // ---- Инициализация MCP23017 ----
 // Повторные попытки после включения питания периферии (POR микросхемы).
-#define MCP_INIT_RETRIES        5
-#define MCP_INIT_RETRY_DELAY_MS 300
+#define MCP_INIT_RETRIES        8
+#define MCP_INIT_RETRY_DELAY_MS 400
 
 // ---- FreeRTOS-периоды (мс) ----
 #define HEARTBEAT_PERIOD_MS   1000   // мигание статусным LED
