@@ -22,11 +22,13 @@ public:
 
     bool init();                       // I2C-мастер + проверка чипа + настройка портов
 
-    // Нативный ESP-IDF I2C мастер (driver/i2c.h) — тот же путь, что в
-    // эталонном esp-idf-примере MCP23017. Wire/NG-драйвер не используется:
-    // его стартовый фиктивный START+STOP ломал транзакции к регистрам.
-    bool ensureNativeBus();            // идемпотентная инициализация порта
-    static constexpr uint8_t I2C_PORT_DEFAULT = 1; // используем порт 1 (Wire — порт 0)
+    // Wire (NG-драйвер Arduino) — единственный I2C мастер проекта.
+    // Нативный ESP-IDF мастер использовать нельзя: Wire занимает порты
+    // 0 и 1 одновременно, его создание вызывает фатальный abort
+    // "CONFLICT! driver_ng is not allowed to be used with this old driver".
+    bool ensureNativeBus();            // всегда false (совместимость вызовов)
+    static void ensureWireBus();         // идемпотентный Wire.begin + clock/timeout
+    static constexpr uint8_t I2C_PORT_DEFAULT = 0; // порт Wire
 
     bool isReady() const { return ready_; }
 
@@ -56,7 +58,8 @@ public:
 private:
     Mcp23017Driver() = default;
     bool ready_ = false;
-    bool nativeReady_ = false; // нативный I2C-мастер (driver/i2c.h) создан
+    static bool sWireReady_;  // Wire.begin() выполнен (мастер проекта)
+    bool nativeReady_ = false; // нативный мастер отключён (конфликт с Wire/NG)
     void *lock_ = nullptr; // SemaphoreHandle_t (не раскрываем FreeRTOS в заголовке)
 
     // Дебаунс порта B: сырое значение, стабилизированное значение, время изменения
@@ -68,6 +71,8 @@ private:
     void releaseLock();
     bool writeReg(uint8_t addr, uint8_t value);
     bool readReg(uint8_t addr, uint8_t &value);
+    bool writeRegQuiet(uint8_t addr, uint8_t value); // без вывода ошибки в лог
+    bool readRegQuiet(uint8_t addr, uint8_t &value); // без вывода ошибки в лог
     static bool probeBus(uint8_t addr);   // ACK-опрос адреса на шине (true = ACK)
     static int  probeBusDetailed(uint8_t addr); // код endTransmission(): 0=ACK, 2=NACK, 4=timeout
     static bool sdaStuckLow();            // проверка линии SDA через INPUT_PULLUP

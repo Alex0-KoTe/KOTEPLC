@@ -15,6 +15,8 @@
 
 static const char *MCP_TAG = "MCP23017";
 
+bool drv::Mcp23017Driver::sWireReady_ = false;
+
 // ---- Регистры MCP23017 (Bank 0, CONFIG.BANK=0, дефолт после POR) ----
 namespace reg {
 constexpr uint8_t IODIRA  = 0x00;
@@ -64,81 +66,72 @@ void Mcp23017Driver::releaseLock() {
 // 2.0.17: после Wire.begin() на пины подаётся фиктивный START+STOP, из-за
 // чего чипы, уже ACK'ующие адрес (скан это подтверждает), не отвечают на
 // реальные обращения Wire к регистрам.
+// ВАЖНО (FW 0.4.5): в Arduino core для esp32dev Wire использует ДВА
+// аппаратных порта сразу (port 0 + port 1). Нативный мастер ESP-IDF на
+// любом из них вызывает фатальный abort: "CONFLICT! driver_ng is not
+// allowed to be used with this old driver". Поэтому нативный путь
+// полностью отключён — все транзакции идут через Wire (NG-драйвер),
+// а проблемы NG обходятся программно (см. init/writeReg/readReg).
 bool Mcp23017Driver::ensureNativeBus() {
-    if (nativeReady_) return true;
-    const i2c_port_t port = (i2c_port_t)mcp_config::I2C_PORT;
-    // Если мастер на этом порту уже был создан ранее — удаляем перед пересозданием.
-    i2c_driver_delete(port); // вернёт ошибку, если порт не инициализирован — не страшно
-    i2c_config_t conf = {};
-    conf.mode = I2C_MODE_MASTER;
-    conf.sda_io_num = (gpio_num_t)mcp_config::SDA_PIN;
-    conf.scl_io_num = (gpio_num_t)mcp_config::SCL_PIN;
-    conf.sda_pullup_en = GPIO_PULLUP_DISABLE; // внешние подтяжки на плате
-    conf.scl_pullup_en = GPIO_PULLUP_DISABLE;
-    conf.master.clk_speed = mcp_config::CLOCK_HZ;
-    if (i2c_param_config(port, &conf) != ESP_OK) return false;
-    if (i2c_driver_install(port, I2C_MODE_MASTER, 0, 0, 0) != ESP_OK) return false;
-    nativeReady_ = true;
+    return false; // нативный мастер не используется (конфликт с Wire/NG)
+}
+
+// Единственный мастер проекта — Wire (Arduino/NG-драйвер, порты 0+1).
+// Вызывается из init() ровно один раз; повторные вызовы безопасны.
+void Mcp23017Driver::ensureWireBus() {
+    if (sWireReady_) return;
+    Wire.begin(mcp_config::SDA_PIN, mcp_config::SCL_PIN);
+    Wire.setClock(mcp_config::CLOCK_HZ);
+    Wire.setTimeOut(mcp_config::WIRE_TIMEOUT_MS);
+    sWireReady_ = true;
+}
+
+// Одна запись регистра через Wire без вывода ошибок в лог.
+bool Mcp23017Driver::writeRegQuiet(uint8_t addr, uint8_t value) {
+    Wire.beginTransmission((uint8_t)mcp_config::I2C_ADDR);
+    Wire.write(addr);
+    Wire.write(value);
+    return Wire.endTransmission() == 0;
+}
+
+// Чтение одного регистра через Wire без вывода ошибок в лог.
+bool Mcp23017Driver::readRegQuiet(uint8_t addr, uint8_t &value) {
+    Wire.beginTransmission((uint8_t)mcp_config::I2C_ADDR);
+    Wire.write(addr);
+    if (Wire.endTransmission(false) != 0) return false; // repeated start
+    const int n = Wire.requestFrom((uint8_t)mcp_config::I2C_ADDR, (uint8_t)1);
+    if (n != 1) { Wire.flush(); return false; }
+    value = Wire.read();
     return true;
 }
 
 bool Mcp23017Driver::writeReg(uint8_t addr, uint8_t value) {
-    if (!ensureNativeBus()) return false;
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (uint8_t)(mcp_config::I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, addr, true);
-    i2c_master_write_byte(cmd, value, true);
-    i2c_master_stop(cmd);
-    esp_err_t err = i2c_master_cmd_begin((i2c_port_t)mcp_config::I2C_PORT, cmd,
-                                         pdMS_TO_TICKS(mcp_config::WIRE_TIMEOUT_MS));
-    i2c_cmd_link_delete(cmd);
-    const bool ok = (err == ESP_OK);
-    if (!ok) {
-        ESP_LOGE(MCP_TAG, "write reg 0x%02X failed (err=%d: %s)",
-                 addr, (int)err, esp_err_to_name(err));
-    }
+    ensureWireBus();
+    const bool ok = writeRegQuiet(addr, value);
+    if (!ok) ESP_LOGE(MCP_TAG, "write reg 0x%02X failed (Wire NACK/timeout)", addr);
     return ok;
 }
 
 bool Mcp23017Driver::readReg(uint8_t addr, uint8_t &value) {
-    if (!ensureNativeBus()) return false;
-    uint8_t byte = 0;
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (uint8_t)(mcp_config::I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, addr, true);
-    i2c_master_start(cmd); // repeated start
-    i2c_master_read_byte(cmd, &byte, I2C_MASTER_LAST_NACK);
-    i2c_master_stop(cmd);
-    esp_err_t err = i2c_master_cmd_begin((i2c_port_t)mcp_config::I2C_PORT, cmd,
-                                         pdMS_TO_TICKS(mcp_config::WIRE_TIMEOUT_MS));
-    i2c_cmd_link_delete(cmd);
-    if (err != ESP_OK) {
-        ESP_LOGE(MCP_TAG, "read reg 0x%02X failed (err=%d: %s)",
-                 addr, (int)err, esp_err_to_name(err));
+    ensureWireBus();
+    if (!readRegQuiet(addr, value)) {
+        ESP_LOGE(MCP_TAG, "read reg 0x%02X failed (Wire NACK/timeout)", addr);
         return false;
     }
-    value = byte;
     return true;
 }
 
 // Результат проверки ACK на адресе: различаем «нет чипа» (NACK, 2),
 // «шина цела, но транзакция сорвалась» (timeout/other) и успех (0).
-// Реализация — через нативный ESP-IDF мастер (см. комментарий к writeReg).
+// Реализация — через Wire (NG-драйвер): endTransmission() возвращает
+// 2 = NACK on address, 1 = data NACK, 3/4 = timeout/other.
 int Mcp23017Driver::probeBusDetailed(uint8_t addr) {
-    auto &self = instance();
-    if (!self.ensureNativeBus()) return 4; // timeout/uninitialized
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (uint8_t)(addr << 1) | I2C_MASTER_WRITE, false /* expect ack */);
-    i2c_master_stop(cmd);
-    esp_err_t err = i2c_master_cmd_begin((i2c_port_t)mcp_config::I2C_PORT, cmd,
-                                         pdMS_TO_TICKS(mcp_config::WIRE_TIMEOUT_MS));
-    i2c_cmd_link_delete(cmd);
-    if (err == ESP_OK) return 0;              // ACK
-    if (err == ESP_ERR_NOT_FOUND) return 2;   // NACK по адресу
-    return 4;                                 // прочее (timeout и т.п.)
+    ensureWireBus();
+    Wire.beginTransmission(addr);
+    const uint8_t err = Wire.endTransmission();
+    if (err == 0) return 0;             // ACK
+    if (err == 2) return 2;             // NACK by address
+    return 4;                           // прочее (timeout и т.п.)
 }
 
 bool Mcp23017Driver::probeBus(uint8_t addr) {
@@ -227,19 +220,15 @@ bool Mcp23017Driver::init() {
         recoverBus();
     }
 
-    // Нативный ESP-IDF мастер (driver/i2c.h) — тот же путь, что в эталонном
-    // esp-idf-примере работы с MCP23017. Wire/NG-драйвер больше не используется:
-    // его стартовый фиктивный START+STOP ломал все транзакции к регистрам.
+    // Единственный мастер — Wire (NG-драйвер). Нативный ESP-IDF мастер
+    // использовать нельзя: Wire занимает порты 0 И 1, и попытка создать
+    // свой мастер приводит к фатальному "CONFLICT! driver_ng is not
+    // allowed to be used with this old driver" (FW 0.4.4 -> 0.4.5).
     if (!ensureLock()) return false;
-    const bool busOk = ensureNativeBus();
+    ensureWireBus();
     releaseLock();
-    if (!busOk) {
-        ESP_LOGE(MCP_TAG, "native I2C master init failed (port=%d sda=%d scl=%d)",
-                 mcp_config::I2C_PORT, mcp_config::SDA_PIN, mcp_config::SCL_PIN);
-        return false;
-    }
     if (!sda_low) {
-        ESP_LOGI(MCP_TAG, "bus lines OK (SDA/SCL idle HIGH), native master @sda=%d scl=%d %u Hz",
+        ESP_LOGI(MCP_TAG, "bus lines OK (SDA/SCL idle HIGH), Wire master @sda=%d scl=%d %u Hz",
                  mcp_config::SDA_PIN, mcp_config::SCL_PIN, (unsigned)mcp_config::CLOCK_HZ);
     }
 
@@ -256,11 +245,13 @@ bool Mcp23017Driver::init() {
     bool present = false;
     if (ackCode == 0) {
         // Проверка регистровой модели: запись IOCON должна считаться обратно.
-        // Повторяем до 3 раз: первая чтение/запись после POR иногда теряется.
-        for (int i = 0; i < 3 && !present; ++i) {
+        // До 5 попыток с паузой 20 мс: после фиктивного START+STOP на старте
+        // Wire чип может «просыпаться» не с первой транзакции. Quiet-версии
+        // не засоряют лог ошибками при переборах.
+        for (int i = 0; i < 5 && !present; ++i) {
             uint8_t v = 0xFF;
-            present = writeReg(reg::IOCONA, 0x00) && readReg(reg::IOCONA, v) && v == 0x00;
-            if (!present) delay(5);
+            present = writeRegQuiet(reg::IOCONA, 0x00) && readRegQuiet(reg::IOCONA, v) && v == 0x00;
+            if (!present) delay(20);
         }
     }
     releaseLock();
@@ -294,7 +285,7 @@ bool Mcp23017Driver::init() {
             uint8_t v1 = 0xFF;
             bool bank1ok = false;
             if (!ensureLock()) return false;
-            bank1ok = writeReg(0x15, 0x00) && readReg(0x15, v1) && v1 == 0x00;
+            bank1ok = writeRegQuiet(0x15, 0x00) && readRegQuiet(0x15, v1) && v1 == 0x00;
             if (!bank1ok) {
                 // Последняя попытка: IOCONA c битом BANK=1 -> читаем IOCONB
                 writeReg(reg::IOCONA, 0x00);
