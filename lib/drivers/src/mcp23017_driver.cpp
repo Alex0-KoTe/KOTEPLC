@@ -89,20 +89,33 @@ bool Mcp23017Driver::probeBus(uint8_t addr) {
     return probeBusDetailed(addr) == 0; // ACK от чипа => устройство на месте
 }
 
-// Проверка «залипания» линии SDA в LOW. Линию временно переводим в режим
-// INPUT_PULLUP (внутренняя подтяжка ~45 кОм): если даже с ней уровень LOW —
-// линию действительно держит чип или коротыш.
-// ВАЖНО (FW 0.4.2): эта диагностика выполняется ДО Wire.begin() и НИКОГДА
-// не трогает пины, если линии свободны. Причина: в Arduino core 2.0.17 для
-// esp32dev активен NG-драйвер I2C (esp32-hal-i2c-ng.c) — он привязывает
-// аппаратный порт к пинам на этапе Wire.begin(). Любое pinMode()/bit-bang
-// по этим пинам ПОСЛЕ инициализации мастера сбрасывает состояние порта, и
-// все последующие транзакции падают с «bus is not initialized» (ровно это
-// наблюдали в логах: ACK на скане был, а записи IOCON — нет).
+// Явно гасим внутреннюю подтяжку ESP32 на пине (на плате есть внешние
+// подтяжки SDA/SCL к +3V3, внутренняя не нужна и паразитна). Arduino-режим
+// INPUT сам выключает pull-up, но делаем это гарантированно на уровне GPIO.
+static void disablePullup(uint8_t pin) {
+    gpio_pulldown_dis((gpio_num_t)pin);
+    gpio_pullup_dis((gpio_num_t)pin);
+}
+
+// Проверка «залипания» линии SDA в LOW. ВАЖНО (FW 0.4.3): на плате есть
+// ВНЕШНИЕ подтяжки SDA/SCL к +3V3, поэтому внутреннюю подтяжку ESP32
+// (~45 кОм) НЕ включаем — режим INPUT_PULLUP паразитен при наличии внешней
+// подтяжки. Линии проверяются в чисто высокоимпедансном режиме INPUT:
+// свободная линия удерживается внешними резисторами в HIGH, LOW может быть
+// только если линию держит чип или есть коротыш.
+// Диагностика выполняется ДО Wire.begin() и НИКОГДА не трогает пины, если
+// линии свободны. Причина: в Arduino core 2.0.17 для esp32dev активен
+// NG-драйвер I2C (esp32-hal-i2c-ng.c) — он привязывает аппаратный порт к
+// пинам на этапе Wire.begin(). Любое pinMode()/bit-bang по этим пинам ПОСЛЕ
+// инициализации мастера сбрасывает состояние порта, и все последующие
+// транзакции падают с «bus is not initialized».
 bool Mcp23017Driver::sdaStuckLow() {
-    pinMode(mcp_config::SDA_PIN, INPUT_PULLUP);
-    pinMode(mcp_config::SCL_PIN, INPUT_PULLUP);
-    delayMicroseconds(50); // дать линиям установиться через подтяжки
+    // Только INPUT (high-Z): внешние подтяжки делают INPUT_PULLUP ненужным.
+    pinMode(mcp_config::SDA_PIN, INPUT);
+    pinMode(mcp_config::SCL_PIN, INPUT);
+    disablePullup(mcp_config::SDA_PIN); // гарантированно гасим внутренний pull-up
+    disablePullup(mcp_config::SCL_PIN);
+    delayMicroseconds(50); // дать линиям установиться через внешние подтяжки
     const bool sda_low = digitalRead(mcp_config::SDA_PIN) == LOW;
     const bool scl_low = digitalRead(mcp_config::SCL_PIN) == LOW;
     if (!sda_low && !scl_low) {
@@ -126,7 +139,7 @@ bool Mcp23017Driver::sdaStuckLow() {
 void Mcp23017Driver::recoverBus() {
     ESP_LOGW(MCP_TAG, "SDA stuck LOW, clock recovery (9x SCL + STOP)");
     pinMode(mcp_config::SCL_PIN, OUTPUT);
-    pinMode(mcp_config::SDA_PIN, INPUT_PULLUP);
+    pinMode(mcp_config::SDA_PIN, INPUT); // внешние подтяжки: внутреннюю не включаем
     for (int i = 0; i < 9; ++i) {
         digitalWrite(mcp_config::SCL_PIN, HIGH);
         delayMicroseconds(5);
