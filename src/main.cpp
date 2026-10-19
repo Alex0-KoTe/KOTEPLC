@@ -254,9 +254,18 @@ void setup() {
     }
     if (!mcpOnline) {
         LOGP("[ERROR] MCP23017 не найден на шине I2C (адрес 0x20, ADDR=GND).\n"
-             "        Диагностика в логе выше: строка 'scan results' и состояние SDA.\n"
+             "        Диагностика в логе выше: код ACK и состояние SDA.\n"
              "        Проверьте: питание периферии (IO4), SDA=IO21/SCL=IO22,\n"
              "        подтяжки 4.7k к +3V3 на SDA/SCL, монтаж микросхемы.\n");
+        // Фallback: чип может быть жив, но «завис» в середине транзакции или
+        // в режиме Bank1/SlewRate после неудачной записи IOCON — снимаем
+        // сброс BANK/SLEW и повторяем попытку один раз.
+        LOGP("[MCP] fallback: reset IOCON (Bank0, slew-rate off) and retry...\n");
+        hal::mcpForceInitFallback();
+        if (hal::mcpInit()) {
+            mcpOnline = true;
+            LOGP("[MCP] MCP23017 online after fallback @0x%02X\n", mcp_config::I2C_ADDR);
+        }
     }
 
     // 1c. Канал RS485: UART + RE/DE (конфигурация — rs485_config.h).

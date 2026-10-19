@@ -12,7 +12,7 @@
 #define DEFAULT_WIFI_PASSWORD ""
 
 // Версия прошивки
-#define FW_VERSION "0.3.3"
+#define FW_VERSION "0.3.4"
 
 // ---- Питание периферии ----
 // PERIPH_EN (IO4): логическая 1 включает питание всей периферии

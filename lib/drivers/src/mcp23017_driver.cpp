@@ -126,6 +126,10 @@ void Mcp23017Driver::recoverBus() {
 }
 
 bool Mcp23017Driver::init() {
+    // Повторный вызов (например, после fallback) не должен пересоздавать
+    // мастер и гонять диагностику шины — чип уже проверен.
+    if (ready_) return true;
+
     Wire.begin(mcp_config::SDA_PIN, mcp_config::SCL_PIN, mcp_config::CLOCK_HZ);
     Wire.setTimeOut(mcp_config::WIRE_TIMEOUT_MS);
 
@@ -137,7 +141,10 @@ bool Mcp23017Driver::init() {
         ESP_LOGI(MCP_TAG, "bus lines OK (SDA idles HIGH, %u pull-up)",
                  (unsigned)mcp_config::SDA_PIN);
     }
-    // После ручного режима пинов пересоздаём мастер (idempotent begin)
+    // После ручного режима пинов возвращаем их в режим I2C: иначе мастер
+    // остаётся на пинах, переведённых в GPIO INPUT/OUTPUT, и ни одна
+    // транзакция не пройдёт. Пересоздаём мастер (end+begin идемпотентны).
+    Wire.end();
     Wire.begin(mcp_config::SDA_PIN, mcp_config::SCL_PIN, mcp_config::CLOCK_HZ);
     Wire.setTimeOut(mcp_config::WIRE_TIMEOUT_MS);
 
@@ -164,39 +171,34 @@ bool Mcp23017Driver::init() {
     releaseLock();
 
     if (!present) {
-        // Честная диагностика: полный ACK-скан 0x08..0x77 с кодами ошибок.
-        char found[64] = "";
+        // Честная диагностика: скан только адресов MCP23017 (0x20..0x27) —
+        // полный скан 0x08..0x77 при зависшей шине «съедает» ~50 мс на каждый
+        // timeout и блокирует старт на десятки секунд.
+        char found[48] = "";
         size_t pos = 0;
-        int nackCnt = 0, tmoCnt = 0, otherCnt = 0;
+        int lastCode = ackCode;
         if (!ensureLock()) return false;
-        for (uint8_t a = 0x08; a <= 0x77; ++a) {
-            const int r = probeBusDetailed(a);
-            if (r == 0) {
-                if (pos < sizeof(found) - 8)
-                    pos += snprintf(found + pos, sizeof(found) - pos, "0x%02X ", a);
-            } else if (r == 2) ++nackCnt;   // штатно: устройства нет
-            else if (r == 4) ++tmoCnt;      // timeout: линия шумит/залипла
-            else ++otherCnt;                // 1=data NACK, 3= arbitration lost
+        for (uint8_t a = 0x20; a <= 0x27; ++a) {
+            lastCode = probeBusDetailed(a);
+            if (lastCode == 0 && pos < sizeof(found) - 8) {
+                pos += snprintf(found + pos, sizeof(found) - pos, "0x%02X ", a);
+            }
         }
         releaseLock();
 
-        char diag[96];
-        snprintf(diag, sizeof(diag),
-                 "scan results: NACK=%d timeout=%d other=%d%s",
-                 nackCnt, tmoCnt, otherCnt,
-                 sda_low ? ", SDA was stuck LOW at boot" : "");
-
         if (found[0]) {
-            ESP_LOGE(MCP_TAG, "no verified chip at 0x%02X (ack=%d) | devices with ACK: %s | %s",
-                     mcp_config::I2C_ADDR, ackCode, found, diag);
+            ESP_LOGE(MCP_TAG, "no verified chip at 0x%02X (ack=%d) | devices with ACK: %s%s",
+                     mcp_config::I2C_ADDR, ackCode, found,
+                     sda_low ? " | SDA was stuck LOW at boot" : "");
         } else if (ackCode == 0) {
             // Адрес ACK'ует, но регистровая модель не подтверждена:
             // вероятнее всего чип в середине POR или линии деградированы.
-            ESP_LOGE(MCP_TAG, "0x%02X ACKs but IOCON verify failed | %s",
-                     mcp_config::I2C_ADDR, diag);
+            ESP_LOGE(MCP_TAG, "0x%02X ACKs but IOCON verify failed%s",
+                     mcp_config::I2C_ADDR, sda_low ? " | SDA was stuck LOW at boot" : "");
         } else {
-            ESP_LOGE(MCP_TAG, "chip not found at 0x%02X (ack code=%d: 0=OK 1=dataNAK 2=NACK 3=arb 4=timeout) | %s",
-                     mcp_config::I2C_ADDR, ackCode, diag);
+            ESP_LOGE(MCP_TAG, "chip not found at 0x%02X (ack code=%d: 0=OK 1=dataNAK 2=NACK 3=arb 4=timeout), scan 0x20..0x27 last=%d%s",
+                     mcp_config::I2C_ADDR, ackCode, lastCode,
+                     sda_low ? " | SDA was stuck LOW at boot" : "");
         }
         return false;
     }
@@ -349,6 +351,21 @@ namespace hal {
 
 bool mcpInit() { return drv::Mcp23017Driver::instance().init(); }
 bool mcpIsReady() { return drv::Mcp23017Driver::instance().isReady(); }
+
+// Fallback-процедура: если предыдущая попытка оборвалась на середине
+// транзакции (или чип залип в Bank1/SlewRate от неудачной записи IOCON),
+// адрес может ACK'овать, но регистры читаться неверно. Пишем оба IOCON по
+// обоим банковским адресам (0x0A/0x0B и 0x14/0x15) со значением 0x00 —
+// это возвращает микросхему в Bank0 с включёнными push-pull выходами.
+void mcpForceInitFallback() {
+    auto &mcp = drv::Mcp23017Driver::instance();
+    Wire.beginTransmission(mcp_config::I2C_ADDR);
+    Wire.write(0x0A); Wire.write(0x00); Wire.endTransmission();
+    Wire.beginTransmission(mcp_config::I2C_ADDR);
+    Wire.write(0x14); Wire.write(0x00); Wire.endTransmission(); // IOCON при BANK=1
+    delay(2);
+    mcp.init(); // повторная полная проверка
+}
 
 bool mcpWrite(int logicalPin, bool high) {
     return drv::Mcp23017Driver::instance().write(static_cast<McpPin>(logicalPin), high);

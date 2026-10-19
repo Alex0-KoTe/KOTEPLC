@@ -20,6 +20,7 @@ namespace hal {
 
 bool mcpInit();                          // инициализация шины + конфигурация портов
 bool mcpIsReady();                       // true, если чип отвечает на I2C
+void mcpForceInitFallback();             // сброс IOCON (Bank0/slew-off) после неудачной инициализации
 
 bool mcpWrite(int logicalPin, bool high);    // прямой уровень пина (без инверсии)
 bool mcpRead(int logicalPin);                // прямой уровень пина (сырое чтение)
