@@ -12,7 +12,7 @@
 #define DEFAULT_WIFI_PASSWORD ""
 
 // Версия прошивки
-#define FW_VERSION "0.4.5"
+#define FW_VERSION "0.5.1"
 
 // ---- Питание периферии ----
 // PERIPH_EN (IO4): логическая 1 включает питание всей периферии
@@ -41,16 +41,13 @@
 #define BUTTON_DEBOUNCE_MS     50    // дебаунс кнопки
 #define FS_LOG_INTERVAL_MS     1000  // запись в лог LittleFS
 #define MCP_POLL_INTERVAL_MS   100   // (резерв) период фоновых операций MCP
-#define DI_POLL_INTERVAL_MS    10    // опрос входов DI0..DI7 + дебаунс (мс)
 
-// ---- Однократный тест реле при старте (проверка железа) ----
-// Задача по очереди щёлкает всеми реле RL0..RL7 с частотой 2 Гц
-// (полупериод 250 мс на реле), затем выключает все и выдаёт в простой UART
-// сообщение "Тест реле пройден".
-#define RELAY_TEST_ENABLED      1
-#define RELAY_TEST_FREQ_HZ      2      // частота переключения, Гц
-#define RELAY_TEST_HALFPERIOD_MS (1000 / RELAY_TEST_FREQ_HZ / 2)  // 250 мс
-#define RELAY_TEST_START_DELAY_MS 2000 // задержка старта после инициализации железа
+// ---- Прикладная логика (входы -> выходы) ----
+// Задача AppLogicTask: периодическое чтение входов DI0..DI7 с дебаунсом
+// (машина дебаунса в драйвере MCP23017, DEBOUNCE_MS) в g_diState и запись
+// слова выходов g_doState в реле RL0..RL7 (порт A). Период цикла опроса:
+#define DI_POLL_INTERVAL_MS    10    // опрос входов DI0..DI7 + дебаунс (мс)
+#define APP_START_DELAY_MS     2000  // задержка старта после инициализации железа
 
 // Настройки последовательного порта отладки
 #define SERIAL_BAUD_RATE 115200

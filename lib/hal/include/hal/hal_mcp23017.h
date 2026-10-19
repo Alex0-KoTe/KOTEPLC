@@ -20,7 +20,6 @@ namespace hal {
 
 bool mcpInit();                          // инициализация шины + конфигурация портов
 bool mcpIsReady();                       // true, если чип отвечает на I2C
-void mcpForceInitFallback();             // сброс IOCON (Bank0/slew-off) после неудачной инициализации
 
 bool mcpWrite(int logicalPin, bool high);    // прямой уровень пина (без инверсии)
 bool mcpRead(int logicalPin);                // прямой уровень пина (сырое чтение)
@@ -32,12 +31,10 @@ bool mcpWritePortB(uint8_t value);           // пакетная запись п
 bool mcpReadPortA(uint8_t &value);           // пакетное чтение порта A
 bool mcpReadPortB(uint8_t &value);           // пакетное чтение порта B (DI0..DI7, сырые)
 
-void mcpPollInputs();                        // периодический опрос+дебаунс входов (задача вызывает ~каждые 5-10 мс)
-
-// [DIAG-PULLUP] сырая запись/чтение регистра MCP23017 (Bank0) для самодиагностики:
-// GPPUA=0x0C, GPPUB=0x0D, GPIOB=0x13, OLATA=0x14. Потокобезопасно (мьютекс драйвера).
-bool mcpDiagWriteReg(uint8_t addr, uint8_t value);
-bool mcpDiagReadReg(uint8_t addr, uint8_t &value);
+// Дебаунс входов DI0..DI7: периодический вызов обновляет внутреннее
+// стабилизированное состояние (машина дебаунса в драйвере, DEBOUNCE_MS).
+void mcpPollInputs();
+uint8_t mcpDebouncedState();                 // бит i = 1 => DIi активен (контакт замкнут на GND)
 
 } // namespace hal
 

@@ -6,8 +6,7 @@
 #include "driver_mcp23017.h"
 
 #include <Arduino.h>
-#include <Wire.h> // только для совместимости; транзакции идут через driver/i2c.h
-#include "driver/i2c.h"
+#include <Wire.h> // Wire (NG-драйвер Arduino) — единственный I2C мастер проекта
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -61,22 +60,11 @@ void Mcp23017Driver::releaseLock() {
     if (lock_) xSemaphoreGive((SemaphoreHandle_t)lock_);
 }
 
-// Транзакции идут через низкоуровневый API driver/i2c.h (i2c_master_*) —
-// как в esp-idf-примере MCP23017. Это обходит баг NG-драйвера Arduino core
-// 2.0.17: после Wire.begin() на пины подаётся фиктивный START+STOP, из-за
-// чего чипы, уже ACK'ующие адрес (скан это подтверждает), не отвечают на
-// реальные обращения Wire к регистрам.
-// ВАЖНО (FW 0.4.5): в Arduino core для esp32dev Wire использует ДВА
-// аппаратных порта сразу (port 0 + port 1). Нативный мастер ESP-IDF на
-// любом из них вызывает фатальный abort: "CONFLICT! driver_ng is not
-// allowed to be used with this old driver". Поэтому нативный путь
-// полностью отключён — все транзакции идут через Wire (NG-драйвер),
-// а проблемы NG обходятся программно (см. init/writeReg/readReg).
-bool Mcp23017Driver::ensureNativeBus() {
-    return false; // нативный мастер не используется (конфликт с Wire/NG)
-}
-
-// Единственный мастер проекта — Wire (Arduino/NG-драйвер, порты 0+1).
+// Единственный I2C мастер проекта — Wire (Arduino/NG-драйвер). ВАЖНО: в
+// Arduino core для esp32dev Wire занимает ДВА аппаратных порта сразу
+// (port 0 + port 1) — создание нативного мастера ESP-IDF на любом из них
+// вызывает фатальный abort "CONFLICT! driver_ng is not allowed to be used
+// with this old driver". Все транзакции идут только через Wire.
 // Вызывается из init() ровно один раз; повторные вызовы безопасны.
 void Mcp23017Driver::ensureWireBus() {
     if (sWireReady_) return;
@@ -257,65 +245,22 @@ bool Mcp23017Driver::init() {
     releaseLock();
 
     if (!present) {
-        // Честная диагностика: скан только адресов MCP23017 (0x20..0x27) —
-        // полный скан 0x08..0x77 при зависшей шине «съедает» ~50 мс на каждый
-        // timeout и блокирует старт на десятки секунд.
+        // Краткая честная диагностика: ACK-опрос только адресов MCP23017
+        // (0x20..0x27). Полный скан при зависшей шине «съедает» секунды.
         char found[48] = "";
         size_t pos = 0;
-        int lastCode = ackCode;
-        bool scanAcked = false;
         if (!ensureLock()) return false;
         for (uint8_t a = 0x20; a <= 0x27; ++a) {
-            lastCode = probeBusDetailed(a);
-            if (lastCode == 0) {
-                scanAcked = true;
-                if (pos < sizeof(found) - 8) {
-                    pos += snprintf(found + pos, sizeof(found) - pos, "0x%02X ", a);
-                }
+            if (probeBusDetailed(a) == 0 && pos < sizeof(found) - 8) {
+                pos += snprintf(found + pos, sizeof(found) - pos, "0x%02X ", a);
             }
         }
         releaseLock();
-
-        if (scanAcked && !sda_low) {
-            // Шина жива и кто-то ACK'ует (скорее всего это наш чип на 0x20),
-            // но IOCON не считался обратно. Типичная причина: регистр IOCON
-            // записан в BANK/SLEW-режиме (Bank1) предыдущей прошивкой или
-            // бит SEQOP/IOCON_LOCK мешает verify. Пробуем вариант Bank1
-            // (IOCONB=0x15), а затем мягкий сброс через повторную запись.
-            uint8_t v1 = 0xFF;
-            bool bank1ok = false;
-            if (!ensureLock()) return false;
-            bank1ok = writeRegQuiet(0x15, 0x00) && readRegQuiet(0x15, v1) && v1 == 0x00;
-            if (!bank1ok) {
-                // Последняя попытка: IOCONA c битом BANK=1 -> читаем IOCONB
-                writeReg(reg::IOCONA, 0x00);
-                delay(2);
-                bank1ok = readReg(reg::IOCONA, v1); // любой ответ = регистр жив
-            }
-            releaseLock();
-            if (bank1ok) {
-                ESP_LOGW(MCP_TAG, "chip at 0x%02X ACKs but IOCON verify failed; "
-                         "accepted as present (devices with ACK: %s)",
-                         mcp_config::I2C_ADDR, found);
-                // Не считаем чип готовым автоматически — main сделает retry;
-                // но diagnostic-строка теперь честная.
-            }
-            ESP_LOGE(MCP_TAG, "no verified chip at 0x%02X (ack=%d) | devices with ACK: %s",
-                     mcp_config::I2C_ADDR, ackCode, found);
-        } else if (found[0]) {
-            ESP_LOGE(MCP_TAG, "no verified chip at 0x%02X (ack=%d) | devices with ACK: %s%s",
-                     mcp_config::I2C_ADDR, ackCode, found,
-                     sda_low ? " | SDA was stuck LOW at boot" : "");
-        } else if (ackCode == 0) {
-            // Адрес ACK'ует, но регистровая модель не подтверждена:
-            // вероятнее всего чип в середине POR или линии деградированы.
-            ESP_LOGE(MCP_TAG, "0x%02X ACKs but IOCON verify failed%s",
-                     mcp_config::I2C_ADDR, sda_low ? " | SDA was stuck LOW at boot" : "");
-        } else {
-            ESP_LOGE(MCP_TAG, "chip not found at 0x%02X (ack code=%d: 0=OK 1=dataNAK 2=NACK 3=arb 4=timeout), scan 0x20..0x27 last=%d%s",
-                     mcp_config::I2C_ADDR, ackCode, lastCode,
-                     sda_low ? " | SDA was stuck LOW at boot" : "");
-        }
+        ESP_LOGE(MCP_TAG, "init failed at 0x%02X (ack=%d)%s%s devices with ACK: %s",
+                 mcp_config::I2C_ADDR, ackCode,
+                 sda_low ? " [SDA was stuck LOW at boot]" : "",
+                 ackCode == 0 ? " [ACK but IOCON verify failed]" : "",
+                 found[0] ? found : "none");
         return false;
     }
 
@@ -419,45 +364,36 @@ bool Mcp23017Driver::relaySet(McpPin pin, bool active) {
     return write(pin, level);
 }
 
-bool Mcp23017Driver::diActive(McpPin pin) const {
-    if (!ready_ || !isValid(pin) || portOf(pin) != 1) return false; // DI — только порт B
-    const uint8_t bit = bitOf(pin);
-    const bool rawLevel = (stableB_ >> bit) & 1;
-    // вход активен при LOW (сухой контакт на GND), если ACTIVE_LOW_INPUT
-    return mcp_config::ACTIVE_LOW_INPUT ? !rawLevel : rawLevel;
-}
-
+// ---- Дебаунс входов DI0..DI7 (порт B) ----
+// Машина дебаунса: сырое слово порта B читается пакетно одним обращением;
+// стабилизированное значение stableB_ обновляется только когда сырое значение
+// не меняется дольше DEBOUNCE_MS. Храним "уровни" (бит = уровень пина),
+// инверсию по ACTIVE_LOW_INPUT применяем на выходе.
 void Mcp23017Driver::pollInputs() {
     if (!ready_) return;
-    uint8_t raw = 0;
-    if (!readPort(1, raw)) return; // порт B
-
-    const uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    uint8_t changedMask = 0;
-
-    if (raw != rawB_) {
-        // сбрасываем таймаут стабильности только для изменившихся битов
-        const uint8_t diff = raw ^ rawB_;
-        for (uint8_t b = 0; b < 8; ++b) {
-            if ((diff >> b) & 1) changeTick_[b] = now;
-        }
-        rawB_ = raw;
-    }
-
-    for (uint8_t b = 0; b < 8; ++b) {
-        const bool rawBit = (rawB_ >> b) & 1;
-        const bool stableBit = (stableB_ >> b) & 1;
-        if (rawBit == stableBit) continue;
-        if (now - changeTick_[b] >= mcp_config::DEBOUNCE_MS) {
-            stableB_ = (uint8_t)((stableB_ & ~(1 << b)) | (rawBit ? (1 << b) : 0));
-            changedMask |= (1 << b);
+    uint8_t val = 0xFF;
+    if (!readPort(1, val)) return;         // ошибка шины — состояние не меняем
+    if (val != rawB_) {                    // перешёл дребезг/изменение контакта
+        rawB_ = val;
+        for (uint8_t i = 0; i < 8; ++i) changeTick_[i] = millis();
+    } else {
+        const uint32_t now = millis();
+        if (val != stableB_ && (now - changeTick_[0]) >= mcp_config::DEBOUNCE_MS) {
+            stableB_ = val;                // уровень держится стабильно — фиксируем
         }
     }
+}
 
-    if (changedMask) {
-        ESP_LOGI(MCP_TAG, "DI state changed: mask=0x%02X stable=0x%02X",
-                 changedMask, stableB_);
-    }
+uint8_t Mcp23017Driver::debouncedState() const {
+    // Слово активных входов: бит i = 1 => DIi активен (контакт замкнут на GND).
+    // До первой успешной инициализации/опроса считаем все входы неактивными.
+    if (!ready_ || stableB_ == 0xFF) return 0x00;
+    return mcp_config::ACTIVE_LOW_INPUT ? static_cast<uint8_t>(~stableB_) : stableB_;
+}
+
+bool Mcp23017Driver::diActive(McpPin pin) const {
+    if (!ready_ || !isValid(pin) || portOf(pin) != 1) return false; // DI — только порт B
+    return (debouncedState() >> bitOf(pin)) & 1;
 }
 
 } // namespace drv
@@ -467,23 +403,6 @@ namespace hal {
 
 bool mcpInit() { return drv::Mcp23017Driver::instance().init(); }
 bool mcpIsReady() { return drv::Mcp23017Driver::instance().isReady(); }
-
-// Fallback-процедура: если предыдущая попытка оборвалась на середине
-// транзакции (или чип залип в Bank1/SlewRate от неудачной записи IOCON),
-// адрес может ACK'овать, но регистры читаться неверно. Пишем оба IOCON по
-// обоим банковским адресам (0x0A/0x0B и 0x14/0x15) со значением 0x00 —
-// это возвращает микросхему в Bank0 с включёнными push-pull выходами.
-void mcpForceInitFallback() {
-    auto &mcp = drv::Mcp23017Driver::instance();
-    if (!mcp.diagEnsureLock()) { mcp.init(); return; }
-    // Пишем оба IOCON напрямую через нативный мастер (без блокировок —
-    // writeReg вызывается уже под захваченным мьютексом).
-    mcp.diagWriteReg(0x0A, 0x00);           // IOCONA (Bank0)
-    mcp.diagWriteReg(0x14, 0x00);           // IOCON при BANK=1
-    mcp.diagReleaseLock();
-    delay(2);
-    mcp.init(); // повторная полная проверка
-}
 
 bool mcpWrite(int logicalPin, bool high) {
     return drv::Mcp23017Driver::instance().write(static_cast<McpPin>(logicalPin), high);
@@ -501,29 +420,12 @@ bool mcpDiActive(int logicalPin) {
     return drv::Mcp23017Driver::instance().diActive(static_cast<McpPin>(logicalPin));
 }
 
-void mcpPollInputs() {
-    drv::Mcp23017Driver::instance().pollInputs();
-}
-
-// [DIAG-PULLUP] сырые регистровые операции для самодиагностики (см. hal_mcp23017.h)
-bool mcpDiagWriteReg(uint8_t addr, uint8_t value) {
-    auto &mcp = drv::Mcp23017Driver::instance();
-    if (!mcp.diagEnsureLock()) return false;
-    const bool ok = mcp.diagWriteReg(addr, value);
-    mcp.diagReleaseLock();
-    return ok;
-}
-bool mcpDiagReadReg(uint8_t addr, uint8_t &value) {
-    auto &mcp = drv::Mcp23017Driver::instance();
-    if (!mcp.diagEnsureLock()) return false;
-    const bool ok = mcp.diagReadReg(addr, value);
-    mcp.diagReleaseLock();
-    return ok;
-}
-
 bool mcpWritePortA(uint8_t value) { return drv::Mcp23017Driver::instance().writePort(0, value); }
 bool mcpWritePortB(uint8_t value) { return drv::Mcp23017Driver::instance().writePort(1, value); }
 bool mcpReadPortA(uint8_t &value) { return drv::Mcp23017Driver::instance().readPort(0, value); }
 bool mcpReadPortB(uint8_t &value) { return drv::Mcp23017Driver::instance().readPort(1, value); }
+
+void mcpPollInputs() { drv::Mcp23017Driver::instance().pollInputs(); }
+uint8_t mcpDebouncedState() { return drv::Mcp23017Driver::instance().debouncedState(); }
 
 } // namespace hal

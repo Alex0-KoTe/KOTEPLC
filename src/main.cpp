@@ -29,7 +29,6 @@
 #include "freertos_task.h"
 
 // Прототипы вспомогательных функций уровня приложения (определения ниже)
-static void simpleUartPrint(const char *msg);
 
 // ---- Задача heartbeat: светодиод HEART на IO16, выход, 1 с вкл / 1 с выкл ----
 // Светодиод активный-низкий: включение = лог.0 на IO16 (драйвер сам инвертирует
@@ -48,92 +47,46 @@ protected:
     }
 };
 
-// ---- Задача опроса дискретных входов DI0..DI7 (MCP23017 порт B, дебаунс в драйвере) ----
-class DiScanTask : public os::TaskBase {
+// ---- Прикладная логика: одна переменная входы, одна выходы ----
+// g_diState — стабилизированное дебаунсом состояние входов DI0..DI7
+// (бит i = 1 => контакт DIi замкнут на GND). Обновляется каждые
+// DI_POLL_INTERVAL_MS задачей AppLogicTask через драйверную машину дебаунса.
+// g_doState — слово выходов RL0..RL7 (бит i = 1 => реле RLi включено).
+// Записывается в порт A только при изменении (без лишних I2C-транзакций).
+// Сейчас выход равен входу (зеркало) — место для реальной логики котла:
+// достаточно заменить строку assign между обработкой и выводом.
+volatile uint8_t g_diState = 0x00; // входы (только чтение из других задач)
+volatile uint8_t g_doState = 0x00; // выходы
+
+class AppLogicTask : public os::TaskBase {
 protected:
     void run() override {
-        uint8_t lastActive = 0x00;
-        // Если MCP23017 не инициализирован — задача не мешает остальным:
-        // периодически проверяет готовность чипа и выходит из цикла, если так и не дождалась.
-        int idleTicks = 0;
+        delayMs(APP_START_DELAY_MS); // ждём завершения инициализации железа
+        uint8_t lastLoggedDi = 0xFF, lastLoggedDo = 0xFF;
         while (isRunning()) {
-            if (!hal::mcpIsReady()) {
-                if (++idleTicks > 6000) { // ~10 минут паузы опроса
-                    LOGP("[DI] MCP23017 недоступен, DiScanTask остановлена\n");
-                    return;
-                }
-                delayMs(DI_POLL_INTERVAL_MS);
-                continue;
-            }
-            idleTicks = 0;
-            // Дебаунс выполняется внутри драйвера одним пакетным чтением порта B
-            hal::mcpPollInputs();
+            if (hal::mcpIsReady()) {
+                // 1) ВХОДЫ: пакетное чтение GPIOB + дебаунс (DEBOUNCE_MS)
+                hal::mcpPollInputs();
+                const uint8_t di = hal::mcpDebouncedState();
+                if (di != g_diState) g_diState = di;
 
-            // Собираем слово активных входов DI0..DI7
-            uint8_t active = 0;
-            for (int i = 0; i < 8; ++i) {
-                if (hal::mcpDiActive(static_cast<int>(static_cast<uint8_t>(McpPin::DI0) + i))) {
-                    active |= (1 << i);
-                }
-            }
-            if (active != lastActive) {
-                LOGP("[DI] active mask = 0x%02X", active);
-                for (int i = 0; i < 8; ++i) {
-                    const bool on = (active >> i) & 1;
-                    if (on != ((lastActive >> i) & 1)) {
-                        LOGP("  DI%d=%d", i, on ? 1 : 0);
+                // 2) ОБРАБОТКА (прикладная логика): пока зеркало DI -> DO
+                const uint8_t doNew = di;
+
+                // 3) ВЫХОДЫ: запись в порт A только при изменении
+                if (doNew != g_doState) {
+                    if (hal::mcpWritePortA(doNew)) {
+                        g_doState = doNew;
                     }
                 }
-                LOGP("\n");
-                lastActive = active;
+                if (di != lastLoggedDi || g_doState != lastLoggedDo) {
+                    LOGP("[APP] DI=0x%02X -> DO=0x%02X\n", di, g_doState);
+                    lastLoggedDi = di;
+                    lastLoggedDo = g_doState;
+                }
             }
             delayMs(DI_POLL_INTERVAL_MS);
         }
-    }
-};
-
-// ---- Задача теста реле: ОДНОКРАТНО по очереди щёлкает всеми реле RL0..RL7 ----
-// Частота переключения — RELAY_TEST_FREQ_HZ (2 Гц => полупериод 250 мс на реле).
-// По завершении все реле выключаются, в простой UART выдаётся
-// сообщение "Тест реле пройден", после чего задача завершается сама.
-class RelayTestTask : public os::TaskBase {
-protected:
-    void run() override {
-        // Задержка перед стартом: даём завершиться инициализации железа
-        delayMs(RELAY_TEST_START_DELAY_MS);
-        // MCP23017 недоступен — пропускаем тест, чтобы не блокировать систему
-        if (!hal::mcpIsReady()) {
-            LOGP("[RTEST] пропущен: MCP23017 недоступен\n");
-            simpleUartPrint("Тест реле пропущен (MCP23017 offline)\r\n");
-            return;
-        }
-        LOGP("[RTEST] старт: RL0..RL7 по очереди, %d Гц\n", RELAY_TEST_FREQ_HZ);
-        bool ok = true;
-        for (int i = 0; i < 8; ++i) {
-            // Включаем текущее реле (RELAY_ACTIVE_LOW учитывается драйвером)
-            if (!hal::mcpRelaySet(static_cast<int>(static_cast<uint8_t>(McpPin::RL0) + i), true)) {
-                ok = false;
-                LOGP("[RTEST] RL%d: ошибка записи (MCP23017 недоступен)\n", i);
-                break;
-            }
-            delayMs(RELAY_TEST_HALFPERIOD_MS);
-            hal::mcpRelaySet(static_cast<int>(static_cast<uint8_t>(McpPin::RL0) + i), false);
-            delayMs(RELAY_TEST_HALFPERIOD_MS);
-            LOGP("[RTEST] RL%d проверено\n", i);
-        }
-        // Гарантированно выключаем все реле
-        for (int i = 0; i < 8; ++i) {
-            hal::mcpRelaySet(static_cast<int>(static_cast<uint8_t>(McpPin::RL0) + i), false);
-        }
-        if (ok) {
-            // Сообщение о выполнении — в простой UART (IO1/IO3, тот же UART0)
-            simpleUartPrint("Тест реле пройден\r\n");
-            LOGP("[RTEST] завершён успешно\n");
-        } else {
-            simpleUartPrint("Тест реле: ОШИБКА (см. лог)\r\n");
-            LOGP("[RTEST] завершён с ошибкой\n");
-        }
-        // Однократная задача: trampoline сам завершит её по выходе из run()
     }
 };
 
@@ -213,25 +166,9 @@ protected:
 };
 
 static HeartbeatTask heartbeatTask;
-static DiScanTask diScanTask;
-#if RELAY_TEST_ENABLED
-static RelayTestTask relayTestTask;   // однократный тест реле при старте
-#endif
+static AppLogicTask appLogicTask;  // входы(g_diState) -> логика -> выходы(g_doState)
 static FsLogTask fsLogTask;
 static Rs485Task rs485Task;
-static volatile bool rs485Ready_ = false;  // UART0 перехвачен RS485-драйвером
-
-// Простой UART (IO1/IO3): до инициализации RS485-драйвера это обычный Serial,
-// после — тот же UART0, проброшенный в Rs485Driver. Пишем прямо в порт, чтобы
-// сообщения теста уходили в простой UART независимо от режима моста логов.
-static void simpleUartPrint(const char *msg) {
-    if (rs485Ready_) {
-        const size_t len = strlen(msg);
-        hal::rsWrite((const uint8_t *)msg, len);
-    } else {
-        Serial.print(msg);
-    }
-}
 
 void setup() {
     const uint32_t bootMs = millis(); // бюджет времени инициализации MCP (non-blocking)
@@ -263,8 +200,8 @@ void setup() {
     //     Инициализация с повторными попытками: чипу после включения питания
     //     по PERIPH_EN нужно время на POR; шина при этом опрашивается заново.
     //     НЕУДАЧНАЯ ИНИЦИАЛИЗАЦИЯ НЕ БЛОКИРУЕТ СИСТЕМУ: дальнейшие обращения
-    //     к чипу экранированы флагом готовности драйвера (ready_), задачи DI/RTEST
-    //     проверяют hal::mcpIsReady() и просто пропускают свою работу.
+    //     к чипу экранированы флагом готовности драйвера (ready_), задача
+    //     AppLogicTask проверяет hal::mcpIsReady() и просто пропускает цикл.
     bool mcpOnline = false;
     for (int attempt = 1; attempt <= MCP_INIT_RETRIES && !mcpOnline; ++attempt) {
         if (hal::mcpInit()) {
@@ -279,8 +216,7 @@ void setup() {
         // Ограничение времени: инициализация расширителя НЕ должна блокировать
         // запуск остальных задач больше MCP_INIT_MAX_BLOCK_MS (мигание LED,
         // LittleFS, RS485 стартуют сразу после этого блока). Превысили бюджет —
-        // выходим из цикла; чип при этом остаётся "offline", задачи DI/RTEST
-        // его пропустят, а фоновой нагрузки на шину не будет.
+        // выходим из цикла; чип при этом остаётся "offline".
         if (!mcpOnline &&
             millis() - bootMs >= (uint32_t)MCP_INIT_MAX_BLOCK_MS) {
             LOGP("[MCP] init budget (%d ms) exceeded, giving up for now (non-blocking)\n",
@@ -290,50 +226,8 @@ void setup() {
     }
     if (!mcpOnline) {
         LOGP("[ERROR] MCP23017 не найден на шине I2C (адрес 0x20, ADDR=GND).\n"
-             "        Диагностика в логе выше: код ACK и состояние SDA.\n"
              "        Проверьте: питание периферии (IO4), SDA=IO21/SCL=IO22,\n"
              "        подтяжки 4.7k к +3V3 на SDA/SCL, монтаж микросхемы.\n");
-        // Фallback: чип может быть жив, но «завис» в середине транзакции или
-        // в режиме Bank1/SlewRate после неудачной записи IOCON — снимаем
-        // сброс BANK/SLEW и повторяем попытку один раз.
-        LOGP("[MCP] fallback: reset IOCON (Bank0, slew-rate off) and retry...\n");
-        hal::mcpForceInitFallback();
-        if (hal::mcpInit()) {
-            mcpOnline = true;
-            LOGP("[MCP] MCP23017 online after fallback @0x%02X\n", mcp_config::I2C_ADDR);
-        }
-    }
-
-    if (mcpOnline) {
-        // [DIAG-PULLUP] Самодиагностика шины по адресу 0x20 (FW 0.3.7):
-        //   1) запись GPPUA(0x0C)=0x55 (внутренние подтяжки GPA0/2/4/6),
-        //   2) чтение обратно того же регистра,
-        //   3) включение одного реле (RL0) через OLATA(0x14).
-        // Порт A настроен как выходы (IODIRA=0x00), поэтому подтяжки безвредны;
-        // тест доказывает работоспособность и записи, и чтения регистров.
-        // Выполняется ТОЛЬКО если чип отвечает, иначе блокирует setup на секунды.
-        uint8_t v = 0x00;
-        LOGP("[PROBE] chip ready=%d, probing reg GPPUA(0x0C) @0x%02X\n",
-             mcpOnline ? 1 : 0, mcp_config::I2C_ADDR);
-        LOGP("[PROBE] step1: write GPPUA(0x0C)=0x55 ... %s\n",
-             hal::mcpDiagWriteReg(0x0C, 0x55) ? "OK" : "FAIL (I2C error)");
-        const bool rdOk = hal::mcpDiagReadReg(0x0C, v);
-        LOGP("[PROBE] step2: read GPPUA(0x0C) -> %s 0x%02X (expect 0x55) %s\n",
-             rdOk ? "OK" : "FAIL", v, (v == 0x55) ? "[MATCH]" : "[MISMATCH]");
-        LOGP("[PROBE] step3: restore GPPUA(0x0C)=0x00 ... %s\n",
-             hal::mcpDiagWriteReg(0x0C, 0x00) ? "OK" : "FAIL");
-        LOGP("[PROBE] step4: relay test RL0 ON (OLATA bit0=1) ... %s\n",
-             hal::mcpRelaySet(static_cast<int>(static_cast<uint8_t>(McpPin::RL0)), true)
-                 ? "OK (реле должно щёлкнуть)" : "FAIL");
-        delay(1000); // видимый импульс ~1 с (щелчок реле / светодиод Opto-RL)
-        uint8_t oda = 0xFF;
-        hal::mcpDiagReadReg(0x14, oda);
-        LOGP("[PROBE] step5: read OLATA(0x14) -> 0x%02X (expect 0x01)\n", oda);
-        LOGP("[PROBE] step6: RL0 OFF (OLATA bit0=0) ... %s\n",
-             hal::mcpRelaySet(static_cast<int>(static_cast<uint8_t>(McpPin::RL0)), false)
-                 ? "OK" : "FAIL");
-    } else {
-        LOGP("[MCP] diagnostics skipped (chip offline), other tasks continue\n");
     }
 
     // 1c. Канал RS485: UART + RE/DE (конфигурация — rs485_config.h).
@@ -341,7 +235,6 @@ void setup() {
     //     перед установкой driver/uart поверх тех же пинов.
     Serial.end();
     if (hal::rsInit()) {
-        rs485Ready_ = true;   // UART0 теперь обслуживает Rs485Driver
 #if RS485_START_MODBUS
         hal::rsSetMode(RsMode::MODBUS_RTU);
 #endif
@@ -364,12 +257,7 @@ void setup() {
 
     // 3. Прикладные FreeRTOS-задачи
     heartbeatTask.start(os::TaskBase::Config{"hb", 3072, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
-    diScanTask.start(os::TaskBase::Config{"di", 3072, tskIDLE_PRIORITY + 2, tskNO_AFFINITY});
-#if RELAY_TEST_ENABLED
-    // Однократный тест реле: старт с задержкой 2 с (железо инициализировано),
-    // после завершения задача сама удаляет себя из планировщика
-    relayTestTask.start(os::TaskBase::Config{"rtest", 3072, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
-#endif
+    appLogicTask.start(os::TaskBase::Config{"app", 3072, tskIDLE_PRIORITY + 2, tskNO_AFFINITY});
     fsLogTask.start(os::TaskBase::Config{"fslog", 4096, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
     rs485Task.start(os::TaskBase::Config{"rs485", 4096, tskIDLE_PRIORITY + 2, tskNO_AFFINITY});
 

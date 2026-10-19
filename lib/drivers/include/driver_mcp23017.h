@@ -9,9 +9,8 @@
 // Драйвер расширителя GPIO MCP23017 (I2C).
 // Вся конфигурация (шина, адрес, режимы портов) — в mcp23017_config.h.
 // Потокобезопасен (мьютекс на обращениях к Wire), может вызываться из задач.
-// Встроенный программный дебаунс дискретных входов DI0..DI7 (порт B):
-// pollInputs() опрашивает порт одним чтением и обновляет стабилизированные
-// состояния; активный уровень входа задаётся ACTIVE_LOW_INPUT.
+// Дискретные входы DI0..DI7 (порт B): diActive() выполняет живое чтение
+// порта; активный уровень входа задаётся ACTIVE_LOW_INPUT.
 // ============================================================================
 
 namespace drv {
@@ -26,9 +25,7 @@ public:
     // Нативный ESP-IDF мастер использовать нельзя: Wire занимает порты
     // 0 и 1 одновременно, его создание вызывает фатальный abort
     // "CONFLICT! driver_ng is not allowed to be used with this old driver".
-    bool ensureNativeBus();            // всегда false (совместимость вызовов)
-    static void ensureWireBus();         // идемпотентный Wire.begin + clock/timeout
-    static constexpr uint8_t I2C_PORT_DEFAULT = 0; // порт Wire
+    static void ensureWireBus();       // идемпотентный Wire.begin + clock/timeout
 
     bool isReady() const { return ready_; }
 
@@ -43,17 +40,11 @@ public:
     bool writePort(uint8_t port, uint8_t value); // port: 0=A, 1=B (latch OLATx)
     bool readPort(uint8_t port, uint8_t &value); // port: 0=A, 1=B (GPIOx)
 
-    void pollInputs();                 // опрос порта B + дебаунс (вызывать из задачи ~5-10 мс)
+    // Дебаунс порта B (входы DI0..DI7). Вызывать периодически из задачи опроса.
+    void pollInputs();                   // пакетное чтение GPIOB + машина дебаунса
+    uint8_t debouncedState() const;      // стабилизированное слово DI0..DI7 (бит i = DIi активен)
 
     static bool isValid(McpPin pin);
-
-    // [DIAG-PULLUP] сырой доступ к регистрам для самодиагностики шины:
-    // вызывающий обязан держать мьютекс (mcpDiagLock/Unlock). Адреса регистров
-    // — Bank0: GPPUA=0x0C, GPPUB=0x0D, GPIOB=0x13, OLATA=0x14.
-    bool diagWriteReg(uint8_t addr, uint8_t value) { return writeReg(addr, value); }
-    bool diagReadReg(uint8_t addr, uint8_t &value) { return readReg(addr, value); }
-    bool diagEnsureLock()   { return ensureLock(); }
-    void diagReleaseLock()  { releaseLock(); }
 
 private:
     Mcp23017Driver() = default;
