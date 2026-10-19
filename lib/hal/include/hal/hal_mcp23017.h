@@ -34,6 +34,11 @@ bool mcpReadPortB(uint8_t &value);           // пакетное чтение п
 
 void mcpPollInputs();                        // периодический опрос+дебаунс входов (задача вызывает ~каждые 5-10 мс)
 
+// [DIAG-PULLUP] сырая запись/чтение регистра MCP23017 (Bank0) для самодиагностики:
+// GPPUA=0x0C, GPPUB=0x0D, GPIOB=0x13, OLATA=0x14. Потокобезопасно (мьютекс драйвера).
+bool mcpDiagWriteReg(uint8_t addr, uint8_t value);
+bool mcpDiagReadReg(uint8_t addr, uint8_t &value);
+
 } // namespace hal
 
 #endif // HAL_MCP23017_H

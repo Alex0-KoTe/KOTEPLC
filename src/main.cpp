@@ -268,6 +268,36 @@ void setup() {
         }
     }
 
+
+    // [DIAG-PULLUP] Самодиагностика шины по адресу 0x20 (FW 0.3.7):
+    //   1) запись GPPUA(0x0C)=0x55 (внутренние подтяжки GPA0/2/4/6),
+    //   2) чтение обратно того же регистра,
+    //   3) включение одного реле (RL0) через OLATA(0x14).
+    // Порт A настроен как выходы (IODIRA=0x00), поэтому подтяжки безвредны;
+    // тест доказывает работоспособность и записи, и чтения регистров.
+    {
+        uint8_t v = 0x00;
+        LOGP("[PROBE] chip ready=%d, probing reg GPPUA(0x0C) @0x%02X\n",
+             mcpOnline ? 1 : 0, mcp_config::I2C_ADDR);
+        LOGP("[PROBE] step1: write GPPUA(0x0C)=0x55 ... %s\n",
+             hal::mcpDiagWriteReg(0x0C, 0x55) ? "OK" : "FAIL (I2C error)");
+        const bool rdOk = hal::mcpDiagReadReg(0x0C, v);
+        LOGP("[PROBE] step2: read GPPUA(0x0C) -> %s 0x%02X (expect 0x55) %s\n",
+             rdOk ? "OK" : "FAIL", v, (v == 0x55) ? "[MATCH]" : "[MISMATCH]");
+        LOGP("[PROBE] step3: restore GPPUA(0x0C)=0x00 ... %s\n",
+             hal::mcpDiagWriteReg(0x0C, 0x00) ? "OK" : "FAIL");
+        LOGP("[PROBE] step4: relay test RL0 ON (OLATA bit0=1) ... %s\n",
+             hal::mcpRelaySet(static_cast<int>(static_cast<uint8_t>(McpPin::RL0)), true)
+                 ? "OK (реле должно щёлкнуть)" : "FAIL");
+        delay(1000); // видимый импульс ~1 с (щелчок реле / светодиод Opto-RL)
+        uint8_t oda = 0xFF;
+        hal::mcpDiagReadReg(0x14, oda);
+        LOGP("[PROBE] step5: read OLATA(0x14) -> 0x%02X (expect 0x01)\n", oda);
+        LOGP("[PROBE] step6: RL0 OFF (OLATA bit0=0) ... %s\n",
+             hal::mcpRelaySet(static_cast<int>(static_cast<uint8_t>(McpPin::RL0)), false)
+                 ? "OK" : "FAIL");
+    }
+
     // 1c. Канал RS485: UART + RE/DE (конфигурация — rs485_config.h).
     //     Arduino HWSerial (Serial) использует UART0 — освобождаем порт
     //     перед установкой driver/uart поверх тех же пинов.

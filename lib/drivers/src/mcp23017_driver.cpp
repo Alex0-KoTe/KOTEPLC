@@ -387,6 +387,22 @@ void mcpPollInputs() {
     drv::Mcp23017Driver::instance().pollInputs();
 }
 
+// [DIAG-PULLUP] сырые регистровые операции для самодиагностики (см. hal_mcp23017.h)
+bool mcpDiagWriteReg(uint8_t addr, uint8_t value) {
+    auto &mcp = drv::Mcp23017Driver::instance();
+    if (!mcp.diagEnsureLock()) return false;
+    const bool ok = mcp.diagWriteReg(addr, value);
+    mcp.diagReleaseLock();
+    return ok;
+}
+bool mcpDiagReadReg(uint8_t addr, uint8_t &value) {
+    auto &mcp = drv::Mcp23017Driver::instance();
+    if (!mcp.diagEnsureLock()) return false;
+    const bool ok = mcp.diagReadReg(addr, value);
+    mcp.diagReleaseLock();
+    return ok;
+}
+
 bool mcpWritePortA(uint8_t value) { return drv::Mcp23017Driver::instance().writePort(0, value); }
 bool mcpWritePortB(uint8_t value) { return drv::Mcp23017Driver::instance().writePort(1, value); }
 bool mcpReadPortA(uint8_t &value) { return drv::Mcp23017Driver::instance().readPort(0, value); }

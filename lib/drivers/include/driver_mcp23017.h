@@ -38,6 +38,14 @@ public:
 
     static bool isValid(McpPin pin);
 
+    // [DIAG-PULLUP] сырой доступ к регистрам для самодиагностики шины:
+    // вызывающий обязан держать мьютекс (mcpDiagLock/Unlock). Адреса регистров
+    // — Bank0: GPPUA=0x0C, GPPUB=0x0D, GPIOB=0x13, OLATA=0x14.
+    bool diagWriteReg(uint8_t addr, uint8_t value) { return writeReg(addr, value); }
+    bool diagReadReg(uint8_t addr, uint8_t &value) { return readReg(addr, value); }
+    bool diagEnsureLock()   { return ensureLock(); }
+    void diagReleaseLock()  { releaseLock(); }
+
 private:
     Mcp23017Driver() = default;
     bool ready_ = false;
