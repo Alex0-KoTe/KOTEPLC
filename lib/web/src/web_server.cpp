@@ -56,11 +56,12 @@ static void handleStatus(AsyncWebServerRequest *req) {
     root["heap_free"] = (uint32_t)ESP.getFreeHeap();
 
     JsonObject wifi = root["wifi"].to<JsonObject>();
-    wifi["mode"] = g_wifi.isApMode() ? "ap" : "sta";
+    // Режим этой платы — AP+STA: точка доступа всегда активна, STA сверху.
+    wifi["mode"] = g_wifi.isConnected() ? "ap+sta" : "ap";
     wifi["connected"] = g_wifi.isConnected();
     wifi["ssid"] = g_wifi.currentSsid();
     wifi["ip"] = g_wifi.localIP();
-    wifi["rssi"] = (!g_wifi.isApMode() && WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+    wifi["rssi"] = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
 
     JsonObject io = root["io"].to<JsonObject>();
     io["mcp_ready"] = (bool)s_mcpReady;
@@ -122,9 +123,10 @@ static void netApplyTask(void *) {
             cfg.wifiSsid = rq.ssid;
             cfg.wifiPassword = rq.pass;
             svc.save(cfg);
-            g_wifi.begin(rq.ssid, rq.pass);      // STA; при неудаче — AP fallback
-            LOGP("[WEB] wifi now: mode=%s ip=%s\n",
-                 g_wifi.isApMode() ? "AP" : "STA", g_wifi.localIP().c_str());
+            g_wifi.begin(rq.ssid, rq.pass);      // AP поднят всегда; сверху — STA
+            LOGP("[WEB] wifi now: sta=%s ip=%s\n",
+                 g_wifi.isConnected() ? "connected" : "down",
+                 g_wifi.localIP().c_str());
         }
         vTaskDelay(pdMS_TO_TICKS(500));
     }

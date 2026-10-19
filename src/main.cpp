@@ -271,8 +271,10 @@ void setup() {
             cfg.wifiPassword = DEFAULT_WIFI_PASSWORD;
         }
         g_wifi.begin(cfg.wifiSsid.c_str(), cfg.wifiPassword.c_str());
-        LOGP("[WIFI] mode=%s ssid=\"%s\" ip=%s\n",
-             g_wifi.isApMode() ? "AP" : "STA", g_wifi.currentSsid().c_str(),
+        LOGP("[WIFI] ap=%s sta=%s ssid=\"%s\" ip=%s\n",
+             AP_SSID,
+             g_wifi.isConnected() ? "connected" : "down",
+             g_wifi.currentSsid().c_str(),
              g_wifi.localIP().c_str());
     }
 

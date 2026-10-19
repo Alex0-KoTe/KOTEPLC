@@ -112,7 +112,7 @@ async function tick(){try{
  document.getElementById('fw').textContent='FW '+s.fw;
  const w=s.wifi;
  document.getElementById('wifiInfo').innerHTML=
-  '<span>Режим</span><span>'+(w.mode==='ap'?'Точка доступа':'Клиент (STA)')+'</span>'+
+  '<span>Режим</span><span>'+(w.mode==='ap'?'Точка доступа':'AP + клиент (STA)')+'</span>'+
   '<span>Статус</span><span>'+(w.connected?'подключён':'нет связи')+'</span>'+
   '<span>SSID</span><span>'+(w.ssid||'—')+'</span>'+
   '<span>IP</span><span>'+w.ip+'</span>'+
