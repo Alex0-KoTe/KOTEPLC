@@ -12,7 +12,7 @@
 #define DEFAULT_WIFI_PASSWORD ""
 
 // Версия прошивки
-#define FW_VERSION "0.3.8"
+#define FW_VERSION "0.3.9"
 
 // ---- Питание периферии ----
 // PERIPH_EN (IO4): логическая 1 включает питание всей периферии
@@ -29,11 +29,9 @@
 #define MCP_INIT_RETRY_DELAY_MS 400
 
 // ---- FreeRTOS-периоды (мс) ----
-// Период = 2 * полупериод. Полупериод 500 мс => полная вспышка (вкл+выкл)
-// длится 1 с, пауза между вспышками — ещё 1 с. Короткая вспышка хорошо
-// видна даже при потоке логов в той же шине RS485.
-#define HEARTBEAT_BLINK_MS     120   // длительность короткой вспышки LED
-#define HEARTBEAT_HALF_PERIOD_MS 500
+// Heartbeat LED: ровно 1 с горит / 1 с гаснет (скважность 50%).
+// Период = 2 * полупериод = 2 с.
+#define HEARTBEAT_HALF_PERIOD_MS 1000  // 1 с горит / 1 с гаснет (50% duty)
 #define HEARTBEAT_PERIOD_MS   (2 * HEARTBEAT_HALF_PERIOD_MS)   // мигание статусным LED
 #define INPUT_POLL_INTERVAL_MS 20    // опрос кнопок/входов
 #define BUTTON_DEBOUNCE_MS     50    // дебаунс кнопки

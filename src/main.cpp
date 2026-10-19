@@ -31,21 +31,19 @@
 // Прототипы вспомогательных функций уровня приложения (определения ниже)
 static void simpleUartPrint(const char *msg);
 
-// ---- Задача heartbeat: КОРОТКАЯ вспышка светодиода HEART на IO16 раз в секунду ----
-// Светодиод активный-низкий: включение = лог.0 (drv сам инвертирует полярность).
-// Раньше LED мигал со скважностью 50% (1 с горит / 1 с гаснет) — при подключении
-// кабеля RS485 это выглядело как «перестал мигать», потому что теперь основной
-// канал логов — шина RS485 и светодиод большую часть времени светится.
-// Теперь: вспышка ~120 мс, остальное время — пауза. Состояние LED НЕ зависит
-// от UART/шины: если вспышек нет совсем — проблема в питании/прошивке.
+// ---- Задача heartbeat: светодиод HEART на IO16, выход, 1 с вкл / 1 с выкл ----
+// Светодиод активный-низкий: включение = лог.0 на IO16 (драйвер сам инвертирует
+// полярность по флагу activeLow в gpio_config.h). Период задаётся
+// HEARTBEAT_PERIOD_MS (2 * HEARTBEAT_HALF_PERIOD_MS = 2 с): ровно 1 с горим,
+// 1 с гаснем (скважность 50%).
 class HeartbeatTask : public os::TaskBase {
 protected:
     void run() override {
+        bool on = false;
         while (isRunning()) {
-            hal::gpioWrite(static_cast<int>(GpioPin::LED_HEART), true);   // LED on
-            delayMs(HEARTBEAT_BLINK_MS);
-            hal::gpioWrite(static_cast<int>(GpioPin::LED_HEART), false);  // LED off
-            delayMs(HEARTBEAT_HALF_PERIOD_MS - HEARTBEAT_BLINK_MS);
+            on = !on;
+            hal::gpioWrite(static_cast<int>(GpioPin::LED_HEART), on);  // true = LED lit (LOW on pin)
+            delayMs(HEARTBEAT_HALF_PERIOD_MS);
         }
     }
 };
