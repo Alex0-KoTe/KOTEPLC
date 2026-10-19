@@ -234,6 +234,7 @@ static void simpleUartPrint(const char *msg) {
 }
 
 void setup() {
+    const uint32_t bootMs = millis(); // бюджет времени инициализации MCP (non-blocking)
     // Отладочный Serial (до инициализации моста логи идут сюда же)
     Serial.begin(SERIAL_BAUD_RATE);
     delay(500);
@@ -274,6 +275,17 @@ void setup() {
             LOGP("[MCP] init attempt %d/%d failed, retry in %d ms\n",
                  attempt, MCP_INIT_RETRIES, MCP_INIT_RETRY_DELAY_MS);
             delay(MCP_INIT_RETRY_DELAY_MS);
+        }
+        // Ограничение времени: инициализация расширителя НЕ должна блокировать
+        // запуск остальных задач больше MCP_INIT_MAX_BLOCK_MS (мигание LED,
+        // LittleFS, RS485 стартуют сразу после этого блока). Превысили бюджет —
+        // выходим из цикла; чип при этом остаётся "offline", задачи DI/RTEST
+        // его пропустят, а фоновой нагрузки на шину не будет.
+        if (!mcpOnline &&
+            millis() - bootMs >= (uint32_t)MCP_INIT_MAX_BLOCK_MS) {
+            LOGP("[MCP] init budget (%d ms) exceeded, giving up for now (non-blocking)\n",
+                 MCP_INIT_MAX_BLOCK_MS);
+            break;
         }
     }
     if (!mcpOnline) {

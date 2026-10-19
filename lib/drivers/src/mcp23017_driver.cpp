@@ -94,12 +94,25 @@ bool Mcp23017Driver::probeBus(uint8_t addr) {
 // линию действительно держит чип или коротыш. digitalRead() по назначенному
 // пину Wire без этого даёт мусор («IO 21 is not set as GPIO»).
 bool Mcp23017Driver::sdaStuckLow() {
+    // ВАЖНО: Wire.begin() на ESP32 (core 2.x) вызывает gpioSetPinFuncInput,
+    // который переводит пины в режим DIGITAL (GPIO), а не I2C-функцию.
+    // Поэтому digitalRead()/pinMode() здесь штатны и безопасны.
     pinMode(mcp_config::SDA_PIN, INPUT_PULLUP);
-    delayMicroseconds(20); // дать линии установиться через подтяжку
-    const bool low = digitalRead(mcp_config::SDA_PIN) == LOW;
+    pinMode(mcp_config::SCL_PIN, INPUT_PULLUP);
+    delayMicroseconds(50); // дать линиям установиться через подтяжки
+    const bool sda_low = digitalRead(mcp_config::SDA_PIN) == LOW;
+    const bool scl_low = digitalRead(mcp_config::SCL_PIN) == LOW;
+    if (!sda_low && !scl_low) {
+        // Линии свободны — ничего трогаем, оставляем пины как есть (DIGITAL
+        // от Wire.begin()), мастер продолжит работу без пересоздания.
+        return false;
+    }
     pinMode(mcp_config::SCL_PIN, OUTPUT); // SCL = HIGH, чтобы slave не ждал тактов
     digitalWrite(mcp_config::SCL_PIN, HIGH);
-    return low;
+    if (scl_low) {
+        ESP_LOGE(MCP_TAG, "SCL (IO%d) stuck LOW at boot — check wiring/short", mcp_config::SCL_PIN);
+    }
+    return sda_low;
 }
 
 // Стандартная процедура восстановления I2C: до 9 тактов SCL + STOP,
@@ -133,20 +146,22 @@ bool Mcp23017Driver::init() {
     Wire.begin(mcp_config::SDA_PIN, mcp_config::SCL_PIN, mcp_config::CLOCK_HZ);
     Wire.setTimeOut(mcp_config::WIRE_TIMEOUT_MS);
 
-    // Диагностика линии ДО обращений к чипу
+    // Диагностика линии ДО обращений к чипу. sdaStuckLow() теперь НЕ трогает
+    // пины, если линии свободны, — пересоздавать мастер не нужно (раньше
+    // Wire.end()/Wire.begin() на ESP32 core 2.x ломал рабочий I2C: второй
+    // begin по занятому порту давал «Bus already started» и мусорные транзакции).
     const bool sda_low = sdaStuckLow();
     if (sda_low) {
         recoverBus();
+        // После bit-bang в GPIO-режиме мастер действительно надо пересоздать:
+        // end+begin идемпотентны, но делаем это ровно один раз и только здесь.
+        Wire.end();
+        Wire.begin(mcp_config::SDA_PIN, mcp_config::SCL_PIN, mcp_config::CLOCK_HZ);
+        Wire.setTimeOut(mcp_config::WIRE_TIMEOUT_MS);
     } else {
-        ESP_LOGI(MCP_TAG, "bus lines OK (SDA idles HIGH, %u pull-up)",
-                 (unsigned)mcp_config::SDA_PIN);
+        ESP_LOGI(MCP_TAG, "bus lines OK (SDA/SCL idle HIGH), master @sda=%d scl=%d %u Hz",
+                 mcp_config::SDA_PIN, mcp_config::SCL_PIN, (unsigned)mcp_config::CLOCK_HZ);
     }
-    // После ручного режима пинов возвращаем их в режим I2C: иначе мастер
-    // остаётся на пинах, переведённых в GPIO INPUT/OUTPUT, и ни одна
-    // транзакция не пройдёт. Пересоздаём мастер (end+begin идемпотентны).
-    Wire.end();
-    Wire.begin(mcp_config::SDA_PIN, mcp_config::SCL_PIN, mcp_config::CLOCK_HZ);
-    Wire.setTimeOut(mcp_config::WIRE_TIMEOUT_MS);
 
     // Проверка присутствия чипа: адрес должен ответить ACK'ом.
     // Первая транзакция после включения питания может сорваться (POR чипа,
@@ -177,16 +192,46 @@ bool Mcp23017Driver::init() {
         char found[48] = "";
         size_t pos = 0;
         int lastCode = ackCode;
+        bool scanAcked = false;
         if (!ensureLock()) return false;
         for (uint8_t a = 0x20; a <= 0x27; ++a) {
             lastCode = probeBusDetailed(a);
-            if (lastCode == 0 && pos < sizeof(found) - 8) {
-                pos += snprintf(found + pos, sizeof(found) - pos, "0x%02X ", a);
+            if (lastCode == 0) {
+                scanAcked = true;
+                if (pos < sizeof(found) - 8) {
+                    pos += snprintf(found + pos, sizeof(found) - pos, "0x%02X ", a);
+                }
             }
         }
         releaseLock();
 
-        if (found[0]) {
+        if (scanAcked && !sda_low) {
+            // Шина жива и кто-то ACK'ует (скорее всего это наш чип на 0x20),
+            // но IOCON не считался обратно. Типичная причина: регистр IOCON
+            // записан в BANK/SLEW-режиме (Bank1) предыдущей прошивкой или
+            // бит SEQOP/IOCON_LOCK мешает verify. Пробуем вариант Bank1
+            // (IOCONB=0x15), а затем мягкий сброс через повторную запись.
+            uint8_t v1 = 0xFF;
+            bool bank1ok = false;
+            if (!ensureLock()) return false;
+            bank1ok = writeReg(0x15, 0x00) && readReg(0x15, v1) && v1 == 0x00;
+            if (!bank1ok) {
+                // Последняя попытка: IOCONA c битом BANK=1 -> читаем IOCONB
+                writeReg(reg::IOCONA, 0x00);
+                delay(2);
+                bank1ok = readReg(reg::IOCONA, v1); // любой ответ = регистр жив
+            }
+            releaseLock();
+            if (bank1ok) {
+                ESP_LOGW(MCP_TAG, "chip at 0x%02X ACKs but IOCON verify failed; "
+                         "accepted as present (devices with ACK: %s)",
+                         mcp_config::I2C_ADDR, found);
+                // Не считаем чип готовым автоматически — main сделает retry;
+                // но diagnostic-строка теперь честная.
+            }
+            ESP_LOGE(MCP_TAG, "no verified chip at 0x%02X (ack=%d) | devices with ACK: %s",
+                     mcp_config::I2C_ADDR, ackCode, found);
+        } else if (found[0]) {
             ESP_LOGE(MCP_TAG, "no verified chip at 0x%02X (ack=%d) | devices with ACK: %s%s",
                      mcp_config::I2C_ADDR, ackCode, found,
                      sda_low ? " | SDA was stuck LOW at boot" : "");
