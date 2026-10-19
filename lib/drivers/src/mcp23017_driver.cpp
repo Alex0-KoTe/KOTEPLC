@@ -91,24 +91,28 @@ bool Mcp23017Driver::probeBus(uint8_t addr) {
 
 // Проверка «залипания» линии SDA в LOW. Линию временно переводим в режим
 // INPUT_PULLUP (внутренняя подтяжка ~45 кОм): если даже с ней уровень LOW —
-// линию действительно держит чип или коротыш. digitalRead() по назначенному
-// пину Wire без этого даёт мусор («IO 21 is not set as GPIO»).
+// линию действительно держит чип или коротыш.
+// ВАЖНО (FW 0.4.2): эта диагностика выполняется ДО Wire.begin() и НИКОГДА
+// не трогает пины, если линии свободны. Причина: в Arduino core 2.0.17 для
+// esp32dev активен NG-драйвер I2C (esp32-hal-i2c-ng.c) — он привязывает
+// аппаратный порт к пинам на этапе Wire.begin(). Любое pinMode()/bit-bang
+// по этим пинам ПОСЛЕ инициализации мастера сбрасывает состояние порта, и
+// все последующие транзакции падают с «bus is not initialized» (ровно это
+// наблюдали в логах: ACK на скане был, а записи IOCON — нет).
 bool Mcp23017Driver::sdaStuckLow() {
-    // ВАЖНО: Wire.begin() на ESP32 (core 2.x) вызывает gpioSetPinFuncInput,
-    // который переводит пины в режим DIGITAL (GPIO), а не I2C-функцию.
-    // Поэтому digitalRead()/pinMode() здесь штатны и безопасны.
     pinMode(mcp_config::SDA_PIN, INPUT_PULLUP);
     pinMode(mcp_config::SCL_PIN, INPUT_PULLUP);
     delayMicroseconds(50); // дать линиям установиться через подтяжки
     const bool sda_low = digitalRead(mcp_config::SDA_PIN) == LOW;
     const bool scl_low = digitalRead(mcp_config::SCL_PIN) == LOW;
     if (!sda_low && !scl_low) {
-        // Линии свободны — ничего трогаем, оставляем пины как есть (DIGITAL
-        // от Wire.begin()), мастер продолжит работу без пересоздания.
+        // Линии свободны. Возвращаем пины в INPUT (высокоимпеданное состояние
+        // с внешней подтяжкой): Wire.begin() сразу после этого назначит их на
+        // I2C-функцию корректно, без всяких пересозданий мастера.
+        pinMode(mcp_config::SDA_PIN, INPUT);
+        pinMode(mcp_config::SCL_PIN, INPUT);
         return false;
     }
-    pinMode(mcp_config::SCL_PIN, OUTPUT); // SCL = HIGH, чтобы slave не ждал тактов
-    digitalWrite(mcp_config::SCL_PIN, HIGH);
     if (scl_low) {
         ESP_LOGE(MCP_TAG, "SCL (IO%d) stuck LOW at boot — check wiring/short", mcp_config::SCL_PIN);
     }
@@ -117,6 +121,8 @@ bool Mcp23017Driver::sdaStuckLow() {
 
 // Стандартная процедура восстановления I2C: до 9 тактов SCL + STOP,
 // чтобы «отпустить» slave, застрявший в середине транзакции.
+// Вызывается ТОЛЬКО когда линии реально залипли (пины ещё не отданы
+// I2C-мастеру) — после bit-bang мастер создаётся заново ровно один раз.
 void Mcp23017Driver::recoverBus() {
     ESP_LOGW(MCP_TAG, "SDA stuck LOW, clock recovery (9x SCL + STOP)");
     pinMode(mcp_config::SCL_PIN, OUTPUT);
@@ -136,6 +142,8 @@ void Mcp23017Driver::recoverBus() {
     delayMicroseconds(5);
     digitalWrite(mcp_config::SDA_PIN, HIGH);
     delayMicroseconds(5);
+    // Пинов касаемся только здесь — после этого Wire.begin() переназначит их
+    // на I2C-функцию (см. init(): единственный повторный begin в проекте).
 }
 
 bool Mcp23017Driver::init() {
@@ -143,18 +151,18 @@ bool Mcp23017Driver::init() {
     // мастер и гонять диагностику шины — чип уже проверен.
     if (ready_) return true;
 
-    Wire.begin(mcp_config::SDA_PIN, mcp_config::SCL_PIN, mcp_config::CLOCK_HZ);
-    Wire.setTimeOut(mcp_config::WIRE_TIMEOUT_MS);
-
-    // Диагностика линии ДО обращений к чипу. sdaStuckLow() теперь НЕ трогает
-    // пины, если линии свободны, — пересоздавать мастер не нужно (раньше
-    // Wire.end()/Wire.begin() на ESP32 core 2.x ломал рабочий I2C: второй
-    // begin по занятому порту давал «Bus already started» и мусорные транзакции).
+    // Диагностика линий ДО создания мастера (см. комментарий к sdaStuckLow):
+    // после Wire.begin() трогать пины нельзя — NG-драйвер теряет порт.
     const bool sda_low = sdaStuckLow();
     if (sda_low) {
         recoverBus();
-        // После bit-bang в GPIO-режиме мастер действительно надо пересоздать:
-        // end+begin идемпотентны, но делаем это ровно один раз и только здесь.
+    }
+
+    Wire.begin(mcp_config::SDA_PIN, mcp_config::SCL_PIN, mcp_config::CLOCK_HZ);
+    Wire.setTimeOut(mcp_config::WIRE_TIMEOUT_MS);
+    if (sda_low) {
+        // После bit-bang мастер пересоздаём ровно один раз (end+begin
+        // идемпотентны именно в этой точке: порт ещё не переиспользовался).
         Wire.end();
         Wire.begin(mcp_config::SDA_PIN, mcp_config::SCL_PIN, mcp_config::CLOCK_HZ);
         Wire.setTimeOut(mcp_config::WIRE_TIMEOUT_MS);
