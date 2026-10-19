@@ -6,18 +6,21 @@
 #include "hal/hal_gpio.h"
 
 // ============================================================================
-// Конфигурация GPIO — единственный источник истины по пинам и режимам.
+// Конфигурация GPIO ESP32 — единственный источник истины по пинам и режимам.
 // Все изменения назначений пинов делаются ТОЛЬКО здесь (в коде драйвера).
 // Остальной код работает только с логическими именами (GpioPin) через HAL.
+//
+// Карта железа KOTELPC:
+//   IO21 -> SDA  шины I2C к MCP23017 (назначается в mcp23017_config.h)
+//   IO22 -> SCL  шины I2C к MCP23017 (назначается в mcp23017_config.h)
+//   IO16 -> HEART pulse LED (мигает, показывая, что прошивка жива)
+//   IO1  -> UART0 TX (отладочный Serial; на кастомных платах можно переназначить)
+//   IO3  -> UART0 RX (загрубочный/прошивочный пин — использовать осторожно)
 // ============================================================================
 
 // Логические имена сигналов (не зависят от физических номеров пинов)
 enum class GpioPin : uint8_t {
-    LED_STATUS,     // индикатор состояния
-    RELAY_1,        // реле 1 (насос / котёл)
-    RELAY_2,        // реле 2 (доп. нагрузка)
-    BTN_1,          // кнопка 1
-    SENSOR_1,       // вход датчика 1 (например, DS18B20 / сухой контакт)
+    LED_HEART,        // индикатор «сердцебиения» (heartbeat pulse LED)
     PIN_COUNT
 };
 
@@ -33,13 +36,18 @@ namespace kGpioConfig {
 constexpr int kCount = static_cast<int>(GpioPin::PIN_COUNT);
 
 // Таблица конфигурации. Индекс = порядковый номер GpioPin.
-// Пины 34..39 — input-only (подтяжки недоступны на 34/35).
+// Реле (RL0..RL7) и дискретные входы (DI0..DI7) висят на MCP23017
+// и описаны в mcp23017_config.h, здесь их нет.
 constexpr GpioSignalConfig table[kCount] = {
-    /* LED_STATUS */ { GPIO_NUM_2,  HalGpioMode::OUTPUT_MODE,       false, false },
-    /* RELAY_1    */ { GPIO_NUM_26, HalGpioMode::OUTPUT_MODE,       false, false },
-    /* RELAY_2    */ { GPIO_NUM_27, HalGpioMode::OUTPUT_MODE,       false, false },
-    /* BTN_1      */ { GPIO_NUM_33, HalGpioMode::INPUT_PULLUP_MODE, true,  false },
-    /* SENSOR_1   */ { GPIO_NUM_32, HalGpioMode::INPUT_PULLUP_MODE, false, false },
+    /* LED_HEART */ { GPIO_NUM_16, HalGpioMode::OUTPUT_MODE, false, false },
+};
+
+// Пины, занятые под другие функции (I2C/UART) — не должны попадать в таблицу.
+constexpr int kReservedPins[] = {
+    21, // SDA  (MCP23017, mcp_config::SDA_PIN)
+    22, // SCL  (MCP23017, mcp_config::SCL_PIN)
+    1,  // UART0 TX
+    3,  // UART0 RX
 };
 
 constexpr bool validate() {
@@ -55,6 +63,10 @@ constexpr bool validate() {
         if (!isInput && p >= 34 && p <= 39) return false;
         // strapped-пины 6..11 не используем как выходы нагрузки
         if (!isInput && p >= 6 && p <= 11) return false;
+        // запрещаем дубли зарезервированных пинов (I2C/UART)
+        for (int r = 0; r < (int)(sizeof(kReservedPins) / sizeof(kReservedPins[0])); ++r) {
+            if (p == kReservedPins[r]) return false;
+        }
     }
     return true;
 }

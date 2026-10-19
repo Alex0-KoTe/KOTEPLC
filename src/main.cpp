@@ -1,5 +1,10 @@
 // KOTELPC — точка входа. FreeRTOS-задачи + LittleFS + драйверы GPIO через HAL.
-// Конфигурация пинов — только в lib/drivers/include/gpio_config.h.
+//
+// Карта железа (конфигурация — только в коде драйвера):
+//   IO21 = SDA MCP23017, IO22 = SCL MCP23017  (mcp23017_config.h)
+//   IO16 = HEART pulse LED                     (gpio_config.h)
+//   IO1  = UART0 TX, IO3 = UART0 RX            (Serial, 115200)
+//   MCP23017: GPA0..GPA7 = реле RL0..RL7, GPB0..GPB7 = входы DI0..DI7 (дебаунс)
 
 #include <Arduino.h>
 #include "freertos/FreeRTOS.h"
@@ -12,13 +17,13 @@
 #include "fs_driver.h"
 #include "freertos_task.h"
 
-// ---- Задача heartbeat: мигание статусным светодиодом (через HAL/драйвер) ----
+// ---- Задача heartbeat: пульсация светодиода HEART на IO16 (через HAL/драйвер) ----
 class HeartbeatTask : public os::TaskBase {
 protected:
     void run() override {
         while (isRunning()) {
             state_ = !state_;
-            hal::gpioWrite(static_cast<int>(GpioPin::LED_STATUS), state_);
+            hal::gpioWrite(static_cast<int>(GpioPin::LED_HEART), state_);
             delayMs(HEARTBEAT_PERIOD_MS);
         }
     }
@@ -26,48 +31,51 @@ private:
     bool state_ = false;
 };
 
-// ---- Задача мониторинха кнопок/входов (дебаунс программный) ----
-class InputTask : public os::TaskBase {
+// ---- Задача опроса дискретных входов DI0..DI7 (MCP23017 порт B, дебаунс в драйвере) ----
+class DiScanTask : public os::TaskBase {
 protected:
     void run() override {
-        bool last = false;
-        uint32_t changeAt = 0;
+        uint8_t lastActive = 0x00;
         while (isRunning()) {
-            const bool raw = hal::gpioRead(static_cast<int>(GpioPin::BTN_1));
-            const uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (raw != last) {
-                if (changeAt == 0) changeAt = now;
-                else if (now - changeAt >= BUTTON_DEBOUNCE_MS) {
-                    last = raw;
-                    changeAt = 0;
-                    Serial.printf("[IN] BTN_1 = %d\n", last ? 1 : 0);
+            // Дебаунс выполняется внутри драйвера одним пакетным чтением порта B
+            hal::mcpPollInputs();
+
+            // Собираем слово активных входов DI0..DI7
+            uint8_t active = 0;
+            for (int i = 0; i < 8; ++i) {
+                if (hal::mcpDiActive(static_cast<int>(static_cast<uint8_t>(McpPin::DI0) + i))) {
+                    active |= (1 << i);
                 }
-            } else {
-                changeAt = 0;
             }
-            delayMs(INPUT_POLL_INTERVAL_MS);
+            if (active != lastActive) {
+                Serial.printf("[DI] active mask = 0x%02X", active);
+                for (int i = 0; i < 8; ++i) {
+                    const bool on = (active >> i) & 1;
+                    if (on != ((lastActive >> i) & 1)) {
+                        Serial.printf("  DI%d=%d", i, on ? 1 : 0);
+                    }
+                }
+                Serial.println();
+                lastActive = active;
+            }
+            delayMs(DI_POLL_INTERVAL_MS);
         }
     }
 };
 
-// ---- Задача расширителя MCP23017: опрос входов порта A, «бегущий огонь» на B ----
-class McpTask : public os::TaskBase {
+// ---- Задача реле: тестовая «бегущая» последовательность RL0..RL7 (порт A) ----
+// В рабочей прошивке этот паттерн заменяется логикой управления котлом.
+class RelayTask : public os::TaskBase {
 protected:
     void run() override {
         uint8_t pattern = 0x01;
-        uint8_t lastInputs = 0xFF;
         while (isRunning()) {
-            // Пакетная запись выхода порта B (логический пин OUT_* через HAL)
-            hal::mcpWritePortB(pattern);
+            // Пакетная запись порта A: бит i = состояние реле RL_i
+            // (RELAY_ACTIVE_LOW учитывается драйвером при поштучном mcpRelaySet;
+            //  при пакетной записи уровень задаётся напрямую)
+            hal::mcpWritePortA(pattern);
             pattern = (uint8_t)((pattern << 1) | (pattern >> 7));
-
-            // Пакетное чтение входов порта A
-            uint8_t inputs = 0;
-            if (hal::mcpReadPortA(inputs) && inputs != lastInputs) {
-                lastInputs = inputs;
-                Serial.printf("[MCP] portA = 0x%02X\n", inputs);
-            }
-            delayMs(MCP_POLL_INTERVAL_MS);
+            delayMs(RELAY_TEST_INTERVAL_MS);
         }
     }
 };
@@ -95,11 +103,12 @@ protected:
 };
 
 static HeartbeatTask heartbeatTask;
-static InputTask inputTask;
-static McpTask mcpTask;
+static DiScanTask diScanTask;
+static RelayTask relayTask;
 static FsLogTask fsLogTask;
 
 void setup() {
+    // UART0: IO1 = TX, IO3 = RX (назначение пинов — в ядре Arduino ESP32)
     Serial.begin(SERIAL_BAUD_RATE);
     delay(500);
 
@@ -108,19 +117,21 @@ void setup() {
     Serial.printf("Chip: %s, rev %d, cores %d, freq %d MHz\n",
                   ESP.getChipModel(), ESP.getChipRevision(),
                   ESP.getChipCores(), ESP.getCpuFreqMHz());
-    Serial.printf("FreeRTOS: tick=%u Hz, idle hooks on\n",
-                  (unsigned)configTICK_RATE_HZ);
+    Serial.println("Pins: IO16=HEART LED, IO1=UART TX, IO3=UART RX, "
+                   "IO21=SDA, IO22=SCL -> MCP23017 (GPA=RL0..RL7, GPB=DI0..DI7)");
 
     // 1. Драйверы железа (конфигурация пинов — внутри драйвера)
     if (!hal::gpioInit()) {
         Serial.println("[FATAL] GPIO driver init failed");
     }
 
-    // 1b. Расширитель GPIO MCP23017 по I2C (адрес/пины — в mcp23017_config.h)
+    // 1b. Расширитель GPIO MCP23017 по I2C (шина/адрес/порты — в mcp23017_config.h)
     if (hal::mcpInit()) {
-        hal::mcpWrite(static_cast<int>(McpPin::OUT_1), true);
-        hal::mcpWrite(static_cast<int>(McpPin::OUT_1), false);
-        Serial.println("[MCP] MCP23017 online");
+        // Тестовый цикл: включить/выключить RL0 — проверка линии и реле
+        hal::mcpRelaySet(static_cast<int>(McpPin::RL0), true);
+        delay(100);
+        hal::mcpRelaySet(static_cast<int>(McpPin::RL0), false);
+        Serial.println("[MCP] MCP23017 online @0x20 (sda=21 scl=22)");
     } else {
         Serial.println("[WARN] MCP23017 not present on I2C bus");
     }
@@ -134,8 +145,8 @@ void setup() {
 
     // 3. Прикладные FreeRTOS-задачи
     heartbeatTask.start(os::TaskBase::Config{"hb", 3072, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
-    inputTask.start(os::TaskBase::Config{"input", 3072, tskIDLE_PRIORITY + 2, tskNO_AFFINITY});
-    mcpTask.start(os::TaskBase::Config{"mcp", 3072, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
+    diScanTask.start(os::TaskBase::Config{"di", 3072, tskIDLE_PRIORITY + 2, tskNO_AFFINITY});
+    relayTask.start(os::TaskBase::Config{"relay", 3072, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
     fsLogTask.start(os::TaskBase::Config{"fslog", 4096, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
 
     Serial.println("[MAIN] tasks started");
@@ -146,4 +157,3 @@ void loop() {
     // Вся полезная работа вынесена в задачи выше.
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
-

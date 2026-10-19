@@ -70,3 +70,17 @@ pio test -e esp32dev    # тесты
 - [PlatformIO Core](https://docs.platformio.org/page/installation.html)
 - ESP32 dev board (esp32dev, 16 мБ flash)
 
+## Карта железа (KOTELPC)
+
+| Сигнал | Пин/порт | Описание |
+|---|---|---|
+| SDA MCP23017 | IO21 | I2C data (100 кГц), конфиг в `lib/drivers/include/mcp23017_config.h` |
+| SCL MCP23017 | IO22 | I2C clock, адрес чипа 0x20 |
+| HEART LED | IO16 | пульсация «сердцебиения», конфиг в `lib/drivers/include/gpio_config.h` |
+| UART TX | IO1 | отладочный Serial 115200 (UART0) |
+| UART RX | IO3 | загрузка/прошивка (boot pin — использовать осторожно) |
+| GPA0..GPA7 | MCP23017 A | релейные выходы RL0..RL7 (RELAY_ACTIVE_LOW настраивается в драйвере) |
+| GPB0..GPB7 | MCP23017 B | дискретные входы DI0..DI7, внутренний pull-up, дебаунс 30 мс в драйвере |
+
+Конфигурация GPIO живёт только в коде драйвера (`gpio_config.h`, `mcp23017_config.h`);
+прикладной код обращается к железу через HAL (`hal::gpio*`, `hal::mcp*`) по логическим именам.

@@ -9,6 +9,7 @@
 #include <Wire.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include <esp_log.h>
 
 static const char *MCP_TAG = "MCP23017";
@@ -97,12 +98,24 @@ bool Mcp23017Driver::init() {
         return false;
     }
 
+    // Инициализируем latch реле выключенными ДО переключения направления
+    // портов (чтобы при старте не было ложных срабатываний RL0..RL7).
+    if (!ensureLock()) return false;
+    bool ok = writeReg(reg::OLATA, 0x00);
+    releaseLock();
+    if (!ok) return false;
+
+    // Дебаунс: сырое/стабилизированное состояние входов = "все разомкнуты"
+    // (при ACTIVE_LOW_INPUT уровень HIGH = неактивно)
+    rawB_ = 0xFF;
+    stableB_ = 0xFF;
+
     // Конфигурация портов из таблицы драйвера
     if (!ensureLock()) return false;
-    bool ok = writeReg(reg::IODIRA, mcp_config::IODIRA) &&
-              writeReg(reg::IODIRB, mcp_config::IODIRB) &&
-              writeReg(reg::GPPUA,  mcp_config::GPPUA)  &&
-              writeReg(reg::GPPUB,  mcp_config::GPPUB)  &&
+    ok = writeReg(reg::IODIRA, mcp_config::IODIRA) &&
+         writeReg(reg::IODIRB, mcp_config::IODIRB) &&
+         writeReg(reg::GPPUA,  mcp_config::GPPUA)  &&
+         writeReg(reg::GPPUB,  mcp_config::GPPUB)  &&
               writeReg(reg::IPOLA,  0x00) &&
               writeReg(reg::IPOLB,  0x00) &&
               writeReg(reg::GPINTENA, 0x00) && // прерывания по изменению выкл.
@@ -178,6 +191,54 @@ bool Mcp23017Driver::readPort(uint8_t port, uint8_t &value) {
     return ok;
 }
 
+
+bool Mcp23017Driver::relaySet(McpPin pin, bool active) {
+    if (!isValid(pin) || portOf(pin) != 0) return false; // реле — только порт A
+    const bool level = mcp_config::RELAY_ACTIVE_LOW ? !active : active;
+    return write(pin, level);
+}
+
+bool Mcp23017Driver::diActive(McpPin pin) const {
+    if (!ready_ || !isValid(pin) || portOf(pin) != 1) return false; // DI — только порт B
+    const uint8_t bit = bitOf(pin);
+    const bool rawLevel = (stableB_ >> bit) & 1;
+    // вход активен при LOW (сухой контакт на GND), если ACTIVE_LOW_INPUT
+    return mcp_config::ACTIVE_LOW_INPUT ? !rawLevel : rawLevel;
+}
+
+void Mcp23017Driver::pollInputs() {
+    if (!ready_) return;
+    uint8_t raw = 0;
+    if (!readPort(1, raw)) return; // порт B
+
+    const uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint8_t changedMask = 0;
+
+    if (raw != rawB_) {
+        // сбрасываем таймаут стабильности только для изменившихся битов
+        const uint8_t diff = raw ^ rawB_;
+        for (uint8_t b = 0; b < 8; ++b) {
+            if ((diff >> b) & 1) changeTick_[b] = now;
+        }
+        rawB_ = raw;
+    }
+
+    for (uint8_t b = 0; b < 8; ++b) {
+        const bool rawBit = (rawB_ >> b) & 1;
+        const bool stableBit = (stableB_ >> b) & 1;
+        if (rawBit == stableBit) continue;
+        if (now - changeTick_[b] >= mcp_config::DEBOUNCE_MS) {
+            stableB_ = (uint8_t)((stableB_ & ~(1 << b)) | (rawBit ? (1 << b) : 0));
+            changedMask |= (1 << b);
+        }
+    }
+
+    if (changedMask) {
+        ESP_LOGI(MCP_TAG, "DI state changed: mask=0x%02X stable=0x%02X",
+                 changedMask, stableB_);
+    }
+}
+
 } // namespace drv
 
 // ---- Реализация HAL ----
@@ -192,6 +253,18 @@ bool mcpWrite(int logicalPin, bool high) {
 
 bool mcpRead(int logicalPin) {
     return drv::Mcp23017Driver::instance().read(static_cast<McpPin>(logicalPin));
+}
+
+bool mcpRelaySet(int logicalPin, bool active) {
+    return drv::Mcp23017Driver::instance().relaySet(static_cast<McpPin>(logicalPin), active);
+}
+
+bool mcpDiActive(int logicalPin) {
+    return drv::Mcp23017Driver::instance().diActive(static_cast<McpPin>(logicalPin));
+}
+
+void mcpPollInputs() {
+    drv::Mcp23017Driver::instance().pollInputs();
 }
 
 bool mcpWritePortA(uint8_t value) { return drv::Mcp23017Driver::instance().writePort(0, value); }

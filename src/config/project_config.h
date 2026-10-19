@@ -19,7 +19,9 @@
 #define INPUT_POLL_INTERVAL_MS 20    // опрос кнопок/входов
 #define BUTTON_DEBOUNCE_MS     50    // дебаунс кнопки
 #define FS_LOG_INTERVAL_MS     1000  // запись в лог LittleFS
-#define MCP_POLL_INTERVAL_MS   100   // опрос расширителя MCP23017
+#define MCP_POLL_INTERVAL_MS   100   // (резерв) период фоновых операций MCP
+#define DI_POLL_INTERVAL_MS    10    // опрос входов DI0..DI7 + дебаунс (мс)
+#define RELAY_TEST_INTERVAL_MS 500   // тестовая последовательность реле RL0..RL7 (мс)
 
 // Настройки последовательного порта отладки
 #define SERIAL_BAUD_RATE 115200
