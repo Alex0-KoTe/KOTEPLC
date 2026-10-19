@@ -1,7 +1,7 @@
 // KOTELPC — точка входа. FreeRTOS-задачи + LittleFS + драйверы GPIO через HAL.
 //
 // Карта железа (конфигурация — только в коде драйвера):
-//   IO21 = SDA MCP23017, IO22 = SCL MCP23017  (mcp23017_config.h)
+//   IO21 = SCL MCP23017, IO22 = SDA MCP23017 (перепутаны на плате, DIAG-SWAP)  (mcp23017_config.h)
 //   IO16 = HEART pulse LED                     (gpio_config.h)
 //   IO1  = UART TX -> RS485 DI                 (rs485_config.h)
 //   IO3  = UART RX <- RS485 RO                 (rs485_config.h)
@@ -223,7 +223,7 @@ void setup() {
          ESP.getChipCores(), ESP.getCpuFreqMHz());
     LOGP("Pins: IO16=HEART LED(active LOW), IO4=PERIPH_EN, IO1=RS485 TX, "
          "IO3=RS485 RX, IO23=RE/DE, "
-         "IO21=SDA, IO22=SCL -> MCP23017 @0x20 (ADDR=GND), "
+         "IO21=SCL, IO22=SDA -> MCP23017 @0x20 (ADDR=GND), "
          "GPA=RL0..RL7, GPB=DI0..DI7\n");
 
     // 1. Драйверы железа (конфигурация пинов — внутри драйвера)
@@ -255,7 +255,7 @@ void setup() {
     if (!mcpOnline) {
         LOGP("[ERROR] MCP23017 не найден на шине I2C (адрес 0x20, ADDR=GND).\n"
              "        Диагностика в логе выше: код ACK и состояние SDA.\n"
-             "        Проверьте: питание периферии (IO4), SDA=IO21/SCL=IO22,\n"
+             "        Проверьте: питание периферии (IO4), SDA=IO22/SCL=IO21,\n"
              "        подтяжки 4.7k к +3V3 на SDA/SCL, монтаж микросхемы.\n");
         // Фallback: чип может быть жив, но «завис» в середине транзакции или
         // в режиме Bank1/SlewRate после неудачной записи IOCON — снимаем
