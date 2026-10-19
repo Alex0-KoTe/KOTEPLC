@@ -35,9 +35,9 @@ void test_periph_en_is_output_io4(void) {
 }
 
 void test_mcp_i2c_pins(void) {
-    // DIAG-SWAP: линии перепутаны на плате — SDA заведена на IO22, SCL на IO21
-    TEST_ASSERT_EQUAL_UINT8(22, mcp_config::SDA_PIN);
-    TEST_ASSERT_EQUAL_UINT8(21, mcp_config::SCL_PIN);
+    // Карта железа: SDA на IO21, SCL на IO22 (DIAG-SWAP отменён)
+    TEST_ASSERT_EQUAL_UINT8(21, mcp_config::SDA_PIN);
+    TEST_ASSERT_EQUAL_UINT8(22, mcp_config::SCL_PIN);
     // Все пины ADDR (A2 A1 A0) притянуты к минусу -> адрес 0x20
     TEST_ASSERT_EQUAL_UINT8(0x20, mcp_config::I2C_ADDR);
 }

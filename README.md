@@ -74,8 +74,8 @@ pio test -e esp32dev    # тесты
 
 | Сигнал | Пин/порт | Описание |
 |---|---|---|
-| SDA MCP23017 | IO22 | I2C data (100 кГц), конфиг в `lib/drivers/include/mcp23017_config.h` |
-| SCL MCP23017 | IO21 | I2C clock, адрес чипа 0x20 (пины ADDR притянуты к GND) |
+| SDA MCP23017 | IO21 | I2C data (50 кГц), конфиг в `lib/drivers/include/mcp23017_config.h` |
+| SCL MCP23017 | IO22 | I2C clock, адрес чипа 0x20 (пины ADDR притянуты к GND) |
 | HEART LED | IO16 | пульсация «сердцебиения»; LED включается подачей логического **0** (activeLow), конфиг в `lib/drivers/include/gpio_config.h` |
 | PERIPH_EN | IO4 | логическая **1** включает питание всей периферии (MCP23017, реле, RS485) после старта программы |
 | UART TX | IO1 | отладочный Serial 115200 (UART0) |
