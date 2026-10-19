@@ -31,18 +31,23 @@
 // Прототипы вспомогательных функций уровня приложения (определения ниже)
 static void simpleUartPrint(const char *msg);
 
-// ---- Задача heartbeat: пульсация светодиода HEART на IO16 (через HAL/драйвер) ----
+// ---- Задача heartbeat: КОРОТКАЯ вспышка светодиода HEART на IO16 раз в секунду ----
+// Светодиод активный-низкий: включение = лог.0 (drv сам инвертирует полярность).
+// Раньше LED мигал со скважностью 50% (1 с горит / 1 с гаснет) — при подключении
+// кабеля RS485 это выглядело как «перестал мигать», потому что теперь основной
+// канал логов — шина RS485 и светодиод большую часть времени светится.
+// Теперь: вспышка ~120 мс, остальное время — пауза. Состояние LED НЕ зависит
+// от UART/шины: если вспышек нет совсем — проблема в питании/прошивке.
 class HeartbeatTask : public os::TaskBase {
 protected:
     void run() override {
         while (isRunning()) {
-            state_ = !state_;
-            hal::gpioWrite(static_cast<int>(GpioPin::LED_HEART), state_);
-            delayMs(HEARTBEAT_PERIOD_MS);
+            hal::gpioWrite(static_cast<int>(GpioPin::LED_HEART), true);   // LED on
+            delayMs(HEARTBEAT_BLINK_MS);
+            hal::gpioWrite(static_cast<int>(GpioPin::LED_HEART), false);  // LED off
+            delayMs(HEARTBEAT_HALF_PERIOD_MS - HEARTBEAT_BLINK_MS);
         }
     }
-private:
-    bool state_ = false;
 };
 
 // ---- Задача опроса дискретных входов DI0..DI7 (MCP23017 порт B, дебаунс в драйвере) ----
