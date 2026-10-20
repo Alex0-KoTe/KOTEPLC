@@ -17,6 +17,9 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_task_wdt.h"
+#include "esp_err.h"
 #include "project_config.h"
 #include "hal/hal_gpio.h"
 #include "hal/hal_mcp23017.h"
@@ -33,6 +36,11 @@
 
 // Прототипы вспомогательных функций уровня приложения (определения ниже)
 
+// Heartbeat для диагностики зависаний через Watchdog Timer (0.6.2):
+// каждая прикладная задача вызывает его в своём цикле; обёртка над
+// esp_task_wdt_reset() определена в секции WDT-монитора ниже.
+inline void wdtKickNow();
+
 // ---- Задача heartbeat: светодиод HEART на IO16, выход, 1 с вкл / 1 с выкл ----
 // Светодиод активный-низкий: включение = лог.0 на IO16 (драйвер сам инвертирует
 // полярность по флагу activeLow в gpio_config.h). Период задаётся
@@ -43,6 +51,7 @@ protected:
     void run() override {
         bool on = false;
         while (isRunning()) {
+            wdtKickNow(); // heartbeat для диагностики зависаний (0.6.2)
             on = !on;
             hal::gpioWrite(static_cast<int>(GpioPin::LED_HEART), on);  // true = LED lit (LOW on pin)
             delayMs(HEARTBEAT_HALF_PERIOD_MS);
@@ -67,6 +76,7 @@ protected:
         delayMs(APP_START_DELAY_MS); // ждём завершения инициализации железа
         uint8_t lastLoggedDi = 0xFF, lastLoggedDo = 0xFF;
         while (isRunning()) {
+            wdtKickNow(); // heartbeat для диагностики зависаний (0.6.2)
             if (hal::mcpIsReady()) {
                 // 1) ВХОДЫ: пакетное чтение GPIOB + дебаунс (DEBOUNCE_MS)
                 hal::mcpPollInputs();
@@ -101,6 +111,7 @@ protected:
     void run() override {
         uint32_t n = 0;
         while (isRunning()) {
+            wdtKickNow(); // heartbeat для диагностики зависаний (0.6.2)
             char line[64];
             snprintf(line, sizeof(line), "[%lus] fs alive, heap=%u\n",
                      (unsigned long)(xTaskGetTickCount() / configTICK_RATE_HZ),
@@ -170,10 +181,152 @@ protected:
     }
 };
 
+// ---- Задача инициализации сети: Wi-Fi + веб-сервер (boot-loop fix 0.6.2) ----
+// Раньше g_wifi.begin() и web::start() вызывались прямо из setup(), т.е.
+// исполнялись в контексте Arduino loopTask со стеком фиксированного размера.
+// Инициализация радиостока (WiFi AP+STA, lwIP, DHCP, ESPAsyncWebServer)
+// требовала больше стека, чем оставалось после LOGP-буферов и локальных
+// объектов ConfigService/DeviceConfig (std::string) — происходило
+// переполнение памяти и boot loop (режим "rst:0xC brownout... / abort() ->
+// перезагрузка по кругу"). Теперь весь сетевой код живёт в выделенной
+// FreeRTOS-задаче с увеличенным статическим стеком 8 КБ; стек задачи
+// защищён MPU-stack overflow detection (при переполнении — чёткий дамп с
+// именем "netboot", а не тихая порча памяти setup()).
+class NetBootTask : public os::TaskBase {
+protected:
+    void run() override {
+        LOGP("[NET] netboot task started (stack %d B, heap=%u)\n",
+             NET_BOOT_TASK_STACK_BYTES, (unsigned)ESP.getFreeHeap());
+
+        // 1. Wi-Fi: настройки из NVS (ConfigService); при пустом SSID или неудаче —
+        //    точка доступа KOTELPC-AP / 12345678 (http://192.168.4.1/).
+        //    Режим постоянный AP+STA (радио этой платы работает только с AP).
+        {
+            ConfigService svc;
+            DeviceConfig cfg;
+            if (!svc.load(cfg)) {
+                cfg.wifiSsid = DEFAULT_WIFI_SSID;
+                cfg.wifiPassword = DEFAULT_WIFI_PASSWORD;
+            }
+            g_wifi.begin(cfg.wifiSsid.c_str(), cfg.wifiPassword.c_str());
+            LOGP("[WIFI] ap=%s sta=%s ssid=\"%s\" ip=%s\n",
+                 AP_SSID,
+                 g_wifi.isConnected() ? "connected" : "down",
+                 g_wifi.currentSsid().c_str(),
+                 g_wifi.localIP().c_str());
+        }
+
+        // 2. Веб-интерфейс (порт 80): вкладки Сеть / Входы-Выходы / Файлы LittleFS
+        web::start();
+
+        LOGP("[NET] network stack up, heap=%u\n", (unsigned)ESP.getFreeHeap());
+        // Инициализация завершена — задача сама завершается (освобождает TCB и
+        // статический стек остаются живы до delete экземпляра — он static).
+    }
+};
+
+// ---- Диагностика Watchdog Timer (boot-loop / зависания) ----
+// Прикладные задачи регистрируются в esp_task_wdt (TWDT) с таймаутом
+// TASK_WDT_TIMEOUT_MS; panic/reboot по WDT ВЫКЛЮЧЕН (trigger_panic=false) —
+// реализована именно ДИАГНОСТИКА: при просрочке heartbeat'а ядро дёргает
+// слабый ISR-хук esp_task_wdt_isr_user_handler(), монитор забирает событие,
+// печатает ИМЕНА зависших задач (esp_task_wdt_print_triggered_tasks + dump
+// uxTaskGetSystemState с остатком стека) и НЕ перезагружает устройство.
+// Задачи кормят собаку через wdtKickNow() (обёртка esp_task_wdt_reset()).
+static const char *const kWatchedTasks[] = {"hb", "app", "fslog", "rs485"};
+
+inline void wdtKickNow() { esp_task_wdt_reset(); }
+
+static bool wdtSubscribeAll() {
+    bool subscribed = false;
+    for (const char *want : kWatchedTasks) {
+        TaskHandle_t h = xTaskGetHandle(want); // NULL, если задача ещё не стартовала
+        if (!h) continue;
+        const esp_err_t err = esp_task_wdt_add(h); // уже подписана -> INVALID_STATE
+        if (err == ESP_OK) {
+            LOGP("[WDT] watching task \"%s\" (timeout %d ms)\n",
+                 want, TASK_WDT_TIMEOUT_MS);
+            subscribed = true;
+        }
+    }
+    return subscribed;
+}
+
+// Прямой дамп списка задач: имя + оставшийся свободный стек (в словах).
+// По имени сразу видно, какая подсистема стала причиной зависания.
+static void wdtDumpTasks() {
+    static TaskStatus_t st[16];
+    UBaseType_t n = uxTaskGetSystemState(st, 16, nullptr);
+    for (UBaseType_t i = 0; i < n; ++i) {
+        LOGP("[WDT]   task \"%s\": prio=%u, stack watermark=%u words\n",
+             st[i].pcTaskName, (unsigned)st[i].uxCurrentPriority,
+             (unsigned)st[i].usStackHighWaterMark);
+    }
+}
+
+// Флаг из ISR TWDT (устанавливается в слабом обработчике ниже), semaphore
+// монитора — пробуждение для печати имён проблемных задач.
+static volatile bool s_wdtFired = false;
+static SemaphoreHandle_t s_wdtSem = nullptr;
+
+// Слабый хук ESP-IDF вызывается из ISR при таймауте TWDT. Переопределяем его
+// только для сигнала монитору (в ISR лог писать нельзя).
+extern "C" void esp_task_wdt_isr_user_handler(void) {
+    s_wdtFired = true;
+    if (s_wdtSem) {
+        BaseType_t hi = pdFALSE;
+        xSemaphoreGiveFromISR(s_wdtSem, &hi);
+        portYIELD_FROM_ISR(hi);
+    }
+}
+
+class WdtMonitorTask : public os::TaskBase {
+protected:
+    void run() override {
+        s_wdtSem = xSemaphoreCreateBinary();
+        // Инициализация TWDT: таймаут TASK_WDT_TIMEOUT_MS, idle-задачи не
+        // контролируем, trigger_panic=false => диагностика БЕЗ reboot/panic
+        // (исключаем новый boot loop из-за ложных срабатываний собаки).
+        esp_task_wdt_config_t cfg = {};
+        cfg.timeout_ms = TASK_WDT_TIMEOUT_MS;
+        cfg.idle_core_mask = 0;
+        cfg.trigger_panic = false;
+        const esp_err_t initErr = esp_task_wdt_init(&cfg); // INVALID_STATE = уже инициализирован
+        if (initErr != ESP_OK && initErr != ESP_ERR_INVALID_STATE) {
+            LOGP("[WDT] init failed: %s\n", esp_err_to_name(initErr));
+            return;
+        }
+        esp_task_wdt_add(nullptr); // подписать саму задачу монитора (кормит каждый цикл)
+        LOGP("[WDT] monitor started (timeout %d ms, no-reboot diagnostics)\n",
+             TASK_WDT_TIMEOUT_MS);
+
+        while (isRunning()) {
+            wdtSubscribeAll(); // подписывает прикладные задачи (hb/app/fslog/rs485)
+            wdtKickNow();      // heartbeat самого монитора
+
+            // Событие TWDT: зависла хотя бы одна подписанная задача.
+            // Печатаем её ИМЯ (штатный вывод ядра + собственный dump задач).
+            if (s_wdtFired) {
+                s_wdtFired = false;
+                int cpusFail = 0;
+                LOGP("[WDT] *** task watchdog triggered (CPU mask=0x%X) — stuck tasks:\n",
+                     (unsigned)cpusFail);
+                // Штатный список задач, не сбросивших TWDT (имена печатает ядро):
+                esp_task_wdt_print_triggered_tasks(nullptr, nullptr, &cpusFail);
+                wdtDumpTasks();
+            }
+            // Ожидаем либо период опроса, либо сигнал из ISR (зависание).
+            xSemaphoreTake(s_wdtSem, pdMS_TO_TICKS(TASK_WDT_CHECK_INTERVAL_MS));
+        }
+    }
+};
+
 static HeartbeatTask heartbeatTask;
 static AppLogicTask appLogicTask;  // входы(g_diState) -> логика -> выходы(g_doState)
 static FsLogTask fsLogTask;
 static Rs485Task rs485Task;
+static NetBootTask netBootTask;    // Wi-Fi + веб-сервер (увеличенный стек 8 КБ)
+static WdtMonitorTask wdtMonTask;  // диагностика зависаний по имени задачи
 
 void setup() {
     const uint32_t bootMs = millis(); // бюджет времени инициализации MCP (non-blocking)
@@ -261,31 +414,23 @@ void setup() {
         fs::FsDriver::instance().mkdir("/www");   // каталог файлов веб-интерфейса
     }
 
-    // 2a. Wi-Fi: настройки из NVS (ConfigService); при пустом SSID или неудаче —
-    //     точка доступа KOTELPC-AP / 12345678 (http://192.168.4.1/).
-    {
-        ConfigService svc;
-        DeviceConfig cfg;
-        if (!svc.load(cfg)) {
-            cfg.wifiSsid = DEFAULT_WIFI_SSID;
-            cfg.wifiPassword = DEFAULT_WIFI_PASSWORD;
-        }
-        g_wifi.begin(cfg.wifiSsid.c_str(), cfg.wifiPassword.c_str());
-        LOGP("[WIFI] ap=%s sta=%s ssid=\"%s\" ip=%s\n",
-             AP_SSID,
-             g_wifi.isConnected() ? "connected" : "down",
-             g_wifi.currentSsid().c_str(),
-             g_wifi.localIP().c_str());
-    }
-
-    // 2b. Веб-интерфейс (порт 80): вкладки Сеть / Входы-Выходы / Файлы LittleFS
-    web::start();
+    // 2a/2b. Wi-Fi и веб-сервер — НЕ в setup(): инициализация сетевого стека
+    //     (WiFi AP+STA, lwIP, ESPAsyncWebServer) перенесена в отдельную
+    //     FreeRTOS-задачу "netboot" со стеком 8 КБ (boot-loop fix 0.6.2).
+    //     В контексте loopTask/setup() её стек не вмещался — переполнение
+    //     памяти вызывало boot loop. Задача сама завершается после старта сети.
+    netBootTask.start(os::TaskBase::Config{
+        "netboot", NET_BOOT_TASK_STACK_BYTES, NET_BOOT_TASK_PRIORITY, tskNO_AFFINITY});
 
     // 3. Прикладные FreeRTOS-задачи
     heartbeatTask.start(os::TaskBase::Config{"hb", 3072, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
     appLogicTask.start(os::TaskBase::Config{"app", 3072, tskIDLE_PRIORITY + 2, tskNO_AFFINITY});
     fsLogTask.start(os::TaskBase::Config{"fslog", 4096, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
     rs485Task.start(os::TaskBase::Config{"rs485", 4096, tskIDLE_PRIORITY + 2, tskNO_AFFINITY});
+
+    // 4. Монитор Watchdog Timer: подписывает задачи на esp_task_wdt и при
+    //    просрочке heartbeat позволяет ядру напечатать имя зависшей задачи.
+    wdtMonTask.start(os::TaskBase::Config{"wdtmon", 3072, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
 
     LOGP("[MAIN] tasks started\n");
 }

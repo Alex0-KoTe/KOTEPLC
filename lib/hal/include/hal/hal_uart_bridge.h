@@ -28,7 +28,14 @@ size_t inputPoll(uint8_t *buf, size_t maxLen); // >0: прочитано, 0: н�
 
 } // namespace hal
 
-// Удобный макрос вместо прямых вызовов Serial в задачах
-#define LOGP(...) hal::logPrint(__VA_ARGS__)
+// Удобный макрос вместо прямых вызовов Serial в задачах.
+// 0.6.2 (boot-loop fix): лог пишется напрямую через Serial.printf — без
+// промежуточного локального буфера char line[192] в hal::logPrint().
+// Локальные буферы на стеке задачи при переполнении стека портили строки и
+// усугубляли крахи; Serial.printf форматирует сразу в TX-буфер Arduino.
+// Примечание: в режиме моста "логи -> шина RS485" (hal::uartToRs485(true))
+// прямой вывод идёт в отладочный Serial; для отправки логов в шину
+// используйте hal::logPrint() явно.
+#define LOGP(...) Serial.printf(__VA_ARGS__)
 
 #endif // HAL_UART_BRIDGE_H

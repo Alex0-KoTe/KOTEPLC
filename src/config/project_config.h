@@ -12,7 +12,23 @@
 #define DEFAULT_WIFI_PASSWORD ""
 
 // Версия прошивки
-#define FW_VERSION "0.6.1"
+#define FW_VERSION "0.6.2"
+
+// ---- Boot-loop fix (0.6.2): Wi-Fi + веб-сервер в отдельной задаче ----
+// Инициализация стека Wi-Fi (lwIP/wpa_supplicant) и AsyncWebServer требует
+// глубокого стека; запуск их из setup() (контекст Arduino loopTask, стек
+// CONFIG_ARDUINO_LOOP_STACK_SIZE) приводил к переполнению памяти и boot loop.
+// Теперь весь сетевой стек стартует в выделенной FreeRTOS-задаче "netboot"
+// с увеличенным стеком 8 КБ.
+#define NET_BOOT_TASK_STACK_BYTES 8192
+#define NET_BOOT_TASK_PRIORITY    (tskIDLE_PRIORITY + 3)
+
+// ---- Watchdog Timer (диагностика зависаний) ----
+// Периодический опрос задач через esp_task_wdt: если задача не сообщает о
+// себе более TASK_WDT_TIMEOUT_MS, WDT печатает dump всех задач — по имени
+// "stuck" задачи видно, какая именно зависла (до сброса, если включён panic).
+#define TASK_WDT_TIMEOUT_MS       10000
+#define TASK_WDT_CHECK_INTERVAL_MS 1000
 
 // ---- Питание периферии ----
 // PERIPH_EN (IO4): логическая 1 включает питание всей периферии
