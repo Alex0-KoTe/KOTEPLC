@@ -212,25 +212,20 @@ static void startNetworkStack() {
     LOGP("[NET] network init start (heap=%u, maxblock=%u)\n",
          (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
-    // 1. Wi-Fi: настройки из NVS (ConfigService); при пустом SSID или неудаче —
-    //    точка доступа KOTELPC-AP / 12345678 (http://192.168.4.1/).
-    //    Режим постоянный AP+STA (радио этой платы работает только с AP).
-    {
-        ConfigService svc;
-        DeviceConfig cfg;
-        if (!svc.load(cfg)) {
-            cfg.wifiSsid = DEFAULT_WIFI_SSID;
-            cfg.wifiPassword = DEFAULT_WIFI_PASSWORD;
-        }
-        dbgStepMark(10); // точка невозврата: СЕЙЧАС поднимаем радио (Wi-Fi ON)
-        g_wifi.begin(cfg.wifiSsid.c_str(), cfg.wifiPassword.c_str());
-        dbgStepMark(7); // Wi-Fi радио стартовало без краха
-        LOGP("[WIFI] ap=%s sta=%s ssid=\"%s\" ip=%s\n",
-             AP_SSID,
-             g_wifi.isConnected() ? "connected" : "down",
-             g_wifi.currentSsid().c_str(),
-             g_wifi.localIP().c_str());
-    }
+    // 1. Только ТОЧКА ДОСТУПА (режим WIFI_AP) — ровно как в эталонной
+    //    прошивке пользователя, где «WiFi AP работает прекрасно» (0.6.9).
+    //    STA-часть (WIFI_AP_STA + WiFi.begin) убрана из стартапа полностью:
+    //    именно она в 0.6.8 приводила к тихому краху сразу после
+    //    Preferences/nvs_open (переход состояния драйвера при отключённом
+    //    WiFi.persistent(false) не сохранял коннект и ронял систему).
+    //    Подключение к домашней сети — исключительно по желанию через
+    //    веб-UI (POST /api/network -> handleLoopTick в контексте loopTask).
+    dbgStepMark(10); // точка невозврата: СЕЙЧАС поднимаем радио (AP ON)
+    g_wifi.startAccessPoint(AP_SSID, AP_PASSWORD);
+    dbgStepMark(7); // Wi-Fi AP стартовал без краха
+    LOGP("[WIFI] ap=%s ip=%s (mode=WIFI_AP, STA off)",
+         AP_SSID, g_wifi.localIP().c_str());
+    LOGP(" by design; connect via web UI)\n");
 
     // 2. Веб-интерфейс (порт 80): вкладки Сеть / Входы-Выходы / Файлы LittleFS
     web::start();
