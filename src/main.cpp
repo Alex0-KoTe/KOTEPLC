@@ -240,6 +240,13 @@ static void startNetworkStack() {
     // WifiManager::startAccessPoint() остаётся для пути веб-UI.
     WiFi.persistent(false);
     WiFi.mode(WIFI_AP);
+    // FW 0.6.13: modemsleep ВЫКЛЮЧЕН сразу перед softAP — совпадает с
+    // эталонной прошивкой, где AP поднимается без единого сбоя. Модуль сна
+    // Wi-Fi (PSM/modem sleep) на этом железе давал пиковое потребление при
+    // первом включении радио — косвенный кандидат на просадку 3V3 в момент
+    // старта AP. Вызов идемпотентен; WifiManager::startAccessPoint() делает
+    // то же самое на пути веб-UI.
+    WiFi.setSleep(false);
     WiFi.softAP(AP_SSID, AP_PASSWORD);
     dbgStepMark(7); // Wi-Fi AP стартовал без краха
     LOGP("[WIFI] ap=%s ip=%s (mode=WIFI_AP, STA off)",
@@ -320,6 +327,17 @@ static void startNetworkStack() {
          s_tcpipReady ? "AP_START" : "timeout, netif-up fallback holds");
 
     LOGP("[NET] network stack up, heap=%u\n", (unsigned)ESP.getFreeHeap());
+
+    // FW 0.6.13 (boot-loop bisect): «маркер выживания» после завершения
+    // setup(). Между "[NET] network stack up" и концом setup() в логе 0.6.12
+    // не печатается НИ ОДНА строка, а следующий boot показывает EXT(4) —
+    // т.е. сброс приходит ровно в этом окне (web::start + RS485 + задачи).
+    // Маркер 12 пишется в NVS ПОСЛЕ всего этого окна: если при следующем
+    // старте last step=12 — код проходит setup до конца, и виновник живёт
+    // в loop()/пост-setup; если last step остаётся 6 — крах внутри окна
+    // (диагностика further бисектится опцией NET_LOOP_MARK_EVERY_MS).
+    dbgStepMark(12);
+    LOGP("[BOOT] setup complete, survived to loop()\n");
 }
 
 // Старый netboot-задачный путь (0.6.2..0.6.5) оставлен как опция: сборка с
@@ -558,6 +576,8 @@ static const char *dbgStepName(int s) {
         case 9:  return "tcpip core primed (0.6.11; legacy: netboot START)";
         case 10: return "Wi-Fi RADIO START (крах внутри WiFi.mode/softAP!)";
         case 11: return "softAP done (legacy)";
+        case 12: return "setup complete, survived to loop (0.6.13)";
+        case 13: return "loop() alive (0.6.13, NET_LOOP_MARK_EVERY_MS)";
         default: return "?";
     }
 }
@@ -746,5 +766,14 @@ void loop() {
     // loopTask не требуется, событие ARDUINO_EVENT_WIFI_AP_START (и все
     // последующие STA/AP-события) устанавливает s_tcpipReady сам.
     web::handleLoopTick();
+#if NET_LOOP_MARK_EVERY_MS
+    // FW 0.6.13 диагностика: периодический NVS-маркер из loopTask — если
+    // сброс приходит уже в loop(), на следующем boot будет last step=13.
+    static uint32_t s_lastLoopMark = 0;
+    if (millis() - s_lastLoopMark >= NET_LOOP_MARK_EVERY_MS) {
+        s_lastLoopMark = millis();
+        dbgStepMark(13);
+    }
+#endif
     vTaskDelay(pdMS_TO_TICKS(10));
 }
