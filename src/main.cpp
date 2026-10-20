@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_task_wdt.h"
+#include "hal/wdt_hal.h"   // FW 0.6.14: wdt_hal_disable (INT_WDT/RWDT)
 #include "esp_err.h"
 #include "esp_netif.h"   // 0.6.11: esp_netif_is_netif_up (прайминг tcpip_thread)
 #include "project_config.h"
@@ -37,6 +38,14 @@
 #include "config_service.h"
 #include "web_server.h"
 
+// FW 0.6.12 (boot-loop fix): флаг готовности ядра TCP/IP. Выставляется по
+// событию ARDUINO_EVENT_WIFI_AP_START (штатное событие режима стартапа этой
+// платы — чистый WIFI_AP) либо fallback'ом по факту поднятого AP netif.
+// Раньше готовность определялась событием STA_START, которое в AP-only
+// стартапе не приходит никогда — ожидание уходило в таймаут, трактовался
+// как фатальный и заканчивался перезагрузкой (SW_CPU_RESET).
+static volatile bool s_tcpipReady = false;
+
 // Прототипы вспомогательных функций уровня приложения (определения ниже)
 
 // Heartbeat для диагностики зависаний через Watchdog Timer (0.6.2):
@@ -47,6 +56,8 @@ inline void wdtKickNow();
 // Маркер шагов инициализации (boot-loop bisect, 0.6.4) — определения ниже,
 // используются и в NetBootTask, и в setup().
 static void dbgStepMark(uint8_t step);
+static bool dbgNvsInit();
+static const char *nvs_anchor_read();
 
 // Инициализация канала RS485 (FW 0.6.7: вынесена из setup() и вызывается
 // ПОСЛЕ старта сети; определение — после объявлений задач ниже).
@@ -232,6 +243,13 @@ static void startNetworkStack() {
     // WifiManager::startAccessPoint() остаётся для пути веб-UI.
     WiFi.persistent(false);
     WiFi.mode(WIFI_AP);
+    // FW 0.6.13: modemsleep ВЫКЛЮЧЕН сразу перед softAP — совпадает с
+    // эталонной прошивкой, где AP поднимается без единого сбоя. Модуль сна
+    // Wi-Fi (PSM/modem sleep) на этом железе давал пиковое потребление при
+    // первом включении радио — косвенный кандидат на просадку 3V3 в момент
+    // старта AP. Вызов идемпотентен; WifiManager::startAccessPoint() делает
+    // то же самое на пути веб-UI.
+    WiFi.setSleep(false);
     WiFi.softAP(AP_SSID, AP_PASSWORD);
     dbgStepMark(7); // Wi-Fi AP стартовал без краха
     LOGP("[WIFI] ap=%s ip=%s (mode=WIFI_AP, STA off)",
@@ -239,8 +257,8 @@ static void startNetworkStack() {
     LOGP(" by design; connect via web UI)\n");
 
     // 2. Веб-интерфейс (порт 80): вкладки Сеть / Входы-Выходы / Файлы LittleFS
-    // 0.6.11: сервер стартует ПОСЛЕ запуска прикладных задач (см. setup()):
-    // поднят ли сервер — сообщает флаг s_webStarted (web::isStarted()).
+    // 0.6.11: сервер стартует ПОСЛЕ запуска прикладных задач (см. setup());
+    // поднят ли он — сообщает web::isRunning() (флаг s_started).
     dbgStepMark(8); // очередь на старт веб-сервера
 
     // 3. TCP/IP «прогрев» (0.6.11) — КЛЮЧЕВОЕ исправление lwIP boot loop.
@@ -261,10 +279,12 @@ static void startNetworkStack() {
     // который идёт через tcpip_callback -> гарантированно создаёт/крутит
     // tcpip_thread на его собственном стеке; блокировка корректно
     // регистрируется владельцем. Вызов идемпотентен и безопасен.
+    // 0.6.12: результат прогрева (apUp) — fallback-доказательство готовности
+    // ядра для флага s_tcpipReady (см. шаг 4 ниже).
     {
         esp_netif_t *apIf = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        bool apUp = false;
         if (apIf) {
-            bool apUp = false;
             for (int i = 0; i < 5 && !apUp; ++i) {
                 apUp = esp_netif_is_netif_up(apIf); // tcpip_callback => wake tcpip_thread
                 if (!apUp) vTaskDelay(pdMS_TO_TICKS(50));
@@ -273,10 +293,62 @@ static void startNetworkStack() {
         } else {
             LOGP("[NET] WARN: AP netif handle not found (default config?)\n");
         }
+        if (apUp) s_tcpipReady = true; // fallback: AP поднят => ядро живо
     }
     dbgStepMark(9); // tcpip_thread разбужен, IP-операции безопасны
 
+    // 4. FW 0.6.12 (boot-loop fix): флаг готовности TCP/IP-ядра выставляется
+    //    по событию ARDUINO_EVENT_WIFI_AP_START вместо STA_START.
+    //    Причина: стартап этой платы — чистый WIFI_AP (STA включается лениво,
+    //    только из веб-UI), поэтому событие STA_START здесь не приходит
+    //    НИКОГДА; любое ожидание «STA-события => ядро готово» в AP-only
+    //    режиме неизбежно уходит в таймаут и заканчивается перезагрузкой
+    //    (SW_CPU_RESET сразу после «[NET] network stack up»). AP_START —
+    //    штатное событие нашего режима (см. лог: mode=WIFI_AP), оно и
+    //    устанавливает s_tcpipReady. Обработчик регистрируется идемпотентно
+    //    (флаг s_apEvtRegistered); если событие уже обработано ESP-аркой
+    //    до регистрации, считается доказательством сам факт поднятого AP
+    //    netif (apUp выше) — событийная очередь Arduino не хранит историю.
+    static bool s_apEvtRegistered = false;
+    if (!s_apEvtRegistered) {
+        WiFi.onEvent([](arduino_event_id_t ev) {
+            if (ev == ARDUINO_EVENT_WIFI_AP_START) s_tcpipReady = true;
+        });
+        s_apEvtRegistered = true;
+    }
+    // Дождаться диспатча AP_START в очереди событий esp_event. В этой сборке
+    // Arduino-core 3.x у WiFiClass НЕТ метода run(): события доставляются
+    // напрямую из esp_event_default_loop (_arduino_event_cb -> onEvent),
+    // поэтому достаточно короткого ожидания под vTaskDelay — ядро-владелец
+    // цикла событий крутится на системном стеке и обработчик сработает сам.
+    // Таймаут НЕ фатален: прайминг tcpip_thread (шаг 3) уже выполнен, сеть
+    // работоспособна.
+    for (int i = 0; i < 20 && !s_tcpipReady; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(25)); // ждём delivery AP_START -> s_tcpipReady
+    }
+    LOGP("[NET] tcpip ready flag=%d (set by %s)\n", (int)s_tcpipReady,
+         s_tcpipReady ? "AP_START" : "timeout, netif-up fallback holds");
+
     LOGP("[NET] network stack up, heap=%u\n", (unsigned)ESP.getFreeHeap());
+
+    // FW 0.6.13 (boot-loop bisect): «маркер выживания» после завершения
+    // setup(). Между "[NET] network stack up" и концом setup() в логе 0.6.12
+    // не печатается НИ ОДНА строка, а следующий boot показывает EXT(4) —
+    // т.е. сброс приходит ровно в этом окне (web::start + RS485 + задачи).
+    // Маркер 12 пишется в NVS ПОСЛЕ всего этого окна: если при следующем
+    // старте last step=12 — код проходит setup до конца, и виновник живёт
+    // в loop()/пост-setup; если last step остаётся 6 — крах внутри окна
+    // (диагностика further бисектится опцией NET_LOOP_MARK_EVERY_MS).
+    // FW 0.6.13 (boot-loop bisect): промежуточный «маркер выживания» после
+    // сетевой инициализации. Финальный маркер + снятие аппаратных watchdog'ов
+    // — в конце setup() (см. шаг 6/7 там же).
+    // FW 0.6.15 (bisect по логу 0.6.14): сброс приходит УЖЕ ПОСЛЕ печати
+    // строки ниже («network init survived», следующий boot = SW_CPU_RESET при
+    // last step=6). Значит виновник живёт строго между этой меткой и концом
+    // setup(): web::start(), RS485, старт задач или финализация. Маркер 12
+    // пишется в NVS ДО печати — теперь его дожитие проверяемо на boot.
+    dbgStepMark(12);
+    LOGP("[BOOT] network init survived, continuing setup()\n");
 }
 
 // Старый netboot-задачный путь (0.6.2..0.6.5) оставлен как опция: сборка с
@@ -515,6 +587,10 @@ static const char *dbgStepName(int s) {
         case 9:  return "tcpip core primed (0.6.11; legacy: netboot START)";
         case 10: return "Wi-Fi RADIO START (крах внутри WiFi.mode/softAP!)";
         case 11: return "softAP done (legacy)";
+        case 12: return "network init survived / setup tail (0.6.13+)";
+        case 13: return "loop() alive (0.6.13, NET_LOOP_MARK_EVERY_MS)";
+        case 14: return "web server begin done (0.6.15 bisect)";
+        case 15: return "before app tasks start (0.6.15 bisect)";
         default: return "?";
     }
 }
@@ -528,6 +604,14 @@ static void logBootResetReason() {
     // Если boot loop остаётся — по этому коду сразу видно, на каком шаге
     // происходит крах (см. таблицу шагов у dbgStepMark()).
     LOGP("[BOOT] last step=%d (%s)\n", dbgStepRead(), dbgStepName(dbgStepRead()));
+    // FW 0.6.14: «якорь» предыдущего запуска — если он равен текущей
+    // FW_VERSION, прошлая прошивка доходила до конца setup() (сброс
+    // произошёл ПОСЛЕ него); если NULL/старая версия — крах ВНУТРИ setup().
+    {
+        const char *anchor = nvs_anchor_read();
+        LOGP("[BOOT] prev setup-complete anchor: %s\n",
+             anchor ? anchor : "(none — previous boot never finished setup)");
+    }
 }
 
 // 0.6.8: диагностика раскладки задач по ядрам (штатная раскладка
@@ -542,6 +626,45 @@ static void dumpTaskCoreAffinity() {
         LOGP("[CORE] task \"%s\": core=%d, prio=%u\n",
              st[i].pcTaskName, (int)st[i].xCoreID, (unsigned)st[i].uxCurrentPriority);
     }
+}
+
+// Пишет raw-маркер namespace "koteldbg"/key "ok" = FW_VERSION (без обёртки
+// Preferences). Идемпотентен; читается на следующем boot (logBootResetReason).
+static void nvs_anchor_setup_ok() {
+    if (!dbgNvsInit()) return;
+    nvs_handle_t h;
+    if (nvs_open("koteldbg", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, "ok", FW_VERSION);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+// Считает якорь предыдущего запуска (NULL, если не установлен).
+static const char *nvs_anchor_read() {
+    static char buf[16];
+    if (!dbgNvsInit()) return nullptr;
+    nvs_handle_t h;
+    if (nvs_open("koteldbg", NVS_READONLY, &h) != ESP_OK) return nullptr;
+    size_t sz = sizeof(buf);
+    const esp_err_t err = nvs_get_str(h, "ok", buf, &sz);
+    nvs_close(h);
+    return (err == ESP_OK) ? buf : nullptr;
+}
+
+// Полное отключение аппаратных watchdog'ов: INT_WDT (CONFIG_ESP32_INT_WDT=y
+// в arduino-esp32 3.x — включается на boot, таймаут ~2 с) и RWDT
+// (CONFIG_ESP32_RTIMER_WDT=y) — через wdt_hal_disable. Вызывается один
+// раз в конце setup().
+// esp_task_wdt_delete(NULL) дополнительно снимает текущую задачу (loopTask)
+// с группового MWDT — дальше собаки не кусаются вовсе.
+static void disableHardwareWatchdogs() {
+    const esp_err_t e1 = esp_task_wdt_delete(NULL); // снять loopTask с MWDT
+    // RWDT (RTC watchdog на boot, таймаут ~2 с): штатный контекст HAL.
+    wdt_hal_context_t rwdt = RWDT_HAL_CONTEXT_DEFAULT();
+    wdt_hal_disable(&rwdt);
+    LOGP("[BOOT] hardware watchdogs disabled: RWDT enabled=%d, MWDT self-unsub=%d\n",
+         (int)wdt_hal_is_enabled(&rwdt), (int)e1);
 }
 
 void setup() {
@@ -663,6 +786,9 @@ void setup() {
 #endif
 
     // 3. Прикладные FreeRTOS-задачи
+    // FW 0.6.15 (bisect): маркер 15 — точка между web::start() и созданием
+    // задач; вместе с 14 даёт трёхточечную бисекцию пост-сетевого окна.
+    dbgStepMark(15);
     heartbeatTask.start(os::TaskBase::Config{"hb", 3072, tskIDLE_PRIORITY + 1, 0});
     appLogicTask.start(os::TaskBase::Config{"app", 3072, tskIDLE_PRIORITY + 2, 0});
     fsLogTask.start(os::TaskBase::Config{"fslog", 4096, tskIDLE_PRIORITY + 1, 0});
@@ -682,11 +808,40 @@ void setup() {
     // «прогрет» (netif поднят, tcpip_thread живёт), loopTask уже работает —
     // listen-портоваться безопасно. Функция идемпотентна (s_started).
     web::start();
+    // FW 0.6.15 (bisect): маркер 14 СРАЗУ после web::start(). Лог 0.6.14:
+    // сброс пришёл в окне между «network init survived» и концом setup(),
+    // а «last step» на boot остался 6 — т.е. ни одна NVS-запись окна не
+    // доживала. Если при следующем boot будет last step=14 — web::start()
+    // прошёл, виновник дальше (задачи/финализация); если снова 6/12 —
+    // крах внутри самого s_server.begin()/AsyncTCP.
+    dbgStepMark(14);
 
     // 5. 0.6.8: диагностика раскладки по ядрам — штатно loopTask/AsyncTCP/
     //    lwIP живут на core 1, esp_wifi на core 0; прикладные задачи закреплены
     //    за core 0 (см. выше). Дамп [CORE] позволяет это проверить в логе.
     dumpTaskCoreAffinity();
+
+    // 6. FW 0.6.14 (boot-loop fix): финальный маркер + якорь + снятие собак.
+    // Лог 0.6.13: строка "[BOOT] setup complete" печаталась (из конца
+    // startNetworkStack), затем ~1..2 с тишины и SW_CPU_RESET; "last step"
+    // при этом всегда =6 — т.е. ни одна NVS-запись после wifi begin не
+    // доживала до следующего старта. Виновник — аппаратный watchdog:
+    // Arduino-core включает INT_WDT/RWDT на boot (~2 с) и кормит их только
+    // во время Wi-Fi-вызовов; после окончания сетевой инициализации собака
+    // висит на idle/core0 и валит систему ровно через ~2 с после «survived
+    // to loop()». diag_step теперь доживает до 12/14 (маркеры пишутся в
+    // самом конце setup, перед возможным срабатыванием собаки), а
+    // disableHardwareWatchdogs() убирает саму причину сброса.
+    // FW 0.6.15: ПОРЯДОК ИЗМЕНЁН — снятие аппаратных watchdog'ов идёт
+    // ПЕРВЫМ, до любых записей в NVS. Запись diag_step/якоря выполняется
+    // через SPI-flash (erase/write), во время которого прерывания
+    // маскируются: если RTC-собака ещё активна, именно эти записи не дают
+    // ей дожить до disableHardwareWatchdogs() (лог 0.6.14: «setup
+    // complete» так и не была напечатана, сброс — сразу после web::start).
+    disableHardwareWatchdogs();
+    dbgStepMark(12);           // теперь доживает до следующего boot
+    nvs_anchor_setup_ok();     // raw-якорь FW_VERSION — переживает WDT-сброс
+    LOGP("[BOOT] setup complete, survived to loop()\n");
 }
 
 void loop() {
@@ -697,6 +852,20 @@ void loop() {
     // контекста loopTask (ядро Arduino): сторонние задачи, дёргающие
     // WiFi.begin()/mode(), ломали блокировки ядра TCP/IP — крах
     // "assert failed: tcp_alloc ... Required to lock TCPIP core".
+    // FW 0.6.12: диспатч WiFi-событий выполняется автоматически ядром
+    // esp_event (_arduino_event_cb -> обработчик WiFi.onEvent); метод
+    // WiFi.run() в Arduino-core 3.x отсутствует — отдельный вызов из
+    // loopTask не требуется, событие ARDUINO_EVENT_WIFI_AP_START (и все
+    // последующие STA/AP-события) устанавливает s_tcpipReady сам.
     web::handleLoopTick();
+#if NET_LOOP_MARK_EVERY_MS
+    // FW 0.6.13 диагностика: периодический NVS-маркер из loopTask — если
+    // сброс приходит уже в loop(), на следующем boot будет last step=13.
+    static uint32_t s_lastLoopMark = 0;
+    if (millis() - s_lastLoopMark >= NET_LOOP_MARK_EVERY_MS) {
+        s_lastLoopMark = millis();
+        dbgStepMark(13);
+    }
+#endif
     vTaskDelay(pdMS_TO_TICKS(10));
 }

@@ -12,7 +12,18 @@
 #define DEFAULT_WIFI_PASSWORD ""
 
 // Версия прошивки
-#define FW_VERSION "0.6.11"
+#define FW_VERSION "0.6.15"
+
+// ---- Boot-loop bisect 0.6.13: периодический NVS-маркер из loop() ----
+// В логе 0.6.12 сброс (SW_CPU_RESET) приходит сразу после "[NET] network
+// stack up", при этом следующая загрузка показывает reset reason = EXT(4).
+// Чтобы отличить крах ВНУТРИ оставшейся части setup() (web::start, RS485,
+// старт задач) от сброса уже в loop()/пост-setup, loopTask пишет маркер
+// step=13 каждые N мс. 0 = выключено (нет лишних NVS-записей). Включается
+// сборкой с -DNET_LOOP_MARK_EVERY_MS=5000.
+#ifndef NET_LOOP_MARK_EVERY_MS
+#define NET_LOOP_MARK_EVERY_MS 0
+#endif
 
 // ---- Boot-loop fix 0.6.7: RS485 ИНИЦИАЛИЗИРУЕТСЯ ПОСЛЕ Wi-Fi ----
 // Диагноз по логам пользователя (0.6.4/0.6.5/0.6.6): крах ВСЕГДА происходит
