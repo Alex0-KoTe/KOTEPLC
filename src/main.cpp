@@ -328,6 +328,34 @@ static Rs485Task rs485Task;
 static NetBootTask netBootTask;    // Wi-Fi + веб-сервер (увеличенный стек 8 КБ)
 static WdtMonitorTask wdtMonTask;  // диагностика зависаний по имени задачи
 
+// Причина последней перезагрузки (0.6.3): при boot loop без этой строки
+// невозможно отличить крах прошивки от сбоя питания. esp_reset_reason()
+// возвращает код причины (RST_REASON_*: PANIC / INT_WDT / TASK_WDT /
+// BROWNOUT / SW_RESET / POWERON ...), расшифровка — в таблице ниже.
+static const char *resetReasonName(int r) {
+    switch (r) {
+        case 1:  return "POWERON (включение/просадка питания)";
+        case 3:  return "SW_RESET (программный restart)";
+        case 4:  return "EXT (кнопка RST / внешний сигнал)";
+        case 5:  return "UNKNOWN_RESET";
+        case 6:  return "DBG_RESET (отладочный сброс)";
+        case 7:  return "BRIDGE_RESET (USB-JTAG bridge)";
+        case 8:  return "RTC_WATCHDOG (RTC WDT)";
+        case 9:  return "PANIC/ABORT (крах прошивки!)";
+        case 10: return "INT_WATCHDOG (INT WDT ядра)";
+        case 11: return "TASK_WATCHDOG (TWDT зависшей задачи!)";
+        case 12: return "BROWNOUT (просадка напряжения питания!)";
+        default: return "other";
+    }
+}
+
+static void logBootResetReason() {
+    const int r = (int)esp_reset_reason();
+    LOGP("[BOOT] reset reason: %d = %s\n", r, resetReasonName(r));
+    LOGP("[BOOT] heap=%u, maxblock=%u\n",
+         (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+}
+
 void setup() {
     const uint32_t bootMs = millis(); // бюджет времени инициализации MCP (non-blocking)
     // Отладочный Serial (до инициализации моста логи идут сюда же)
@@ -335,6 +363,7 @@ void setup() {
     delay(500);
 
     LOGP("\nKOTELPC boot. FW version: %s\n", FW_VERSION);
+    logBootResetReason(); // 0.6.3: журнал причин перезагрузки (диагностика boot loop)
     LOGP("Chip: %s, rev %d, cores %d, freq %d MHz\n",
          ESP.getChipModel(), ESP.getChipRevision(),
          ESP.getChipCores(), ESP.getCpuFreqMHz());

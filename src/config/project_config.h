@@ -12,14 +12,19 @@
 #define DEFAULT_WIFI_PASSWORD ""
 
 // Версия прошивки
-#define FW_VERSION "0.6.2"
+#define FW_VERSION "0.6.3"
 
-// ---- Boot-loop fix (0.6.2): Wi-Fi + веб-сервер в отдельной задаче ----
+// ---- Boot-loop fix (0.6.2/0.6.3): Wi-Fi + веб-сервер в отдельной задаче ----
 // Инициализация стека Wi-Fi (lwIP/wpa_supplicant) и AsyncWebServer требует
 // глубокого стека; запуск их из setup() (контекст Arduino loopTask, стек
 // CONFIG_ARDUINO_LOOP_STACK_SIZE) приводил к переполнению памяти и boot loop.
-// Теперь весь сетевой стек стартует в выделенной FreeRTOS-задаче "netboot"
-// с увеличенным стеком 8 КБ.
+// Теперь весь сетевой стек стартует в выделенной FreeRTOS-задаче "netboot".
+// ВНИМАНИЕ (0.6.3): стек задачи выделяется СТАТИЧЕСКИ (xTaskCreateStatic,
+// буфер std::vector<StackType_t> живёт в куче всё время жизни задачи).
+// 8 КБ стека + TCB — это ~8.5 КБ непрерывного DRAM-блока на раннем этапе
+// загрузки, когда Wi-Fi/lwIP-пул ещё не аллокирован и фрагментация минимальна,
+// поэтому 8 КБ безопасны. УМЕНЬШАТЬ ЭТОТ РАЗМЕР НЕЛЬЗЯ: при переполнении
+// стека netboot происходит exactly то же повреждение памяти и boot loop.
 #define NET_BOOT_TASK_STACK_BYTES 8192
 #define NET_BOOT_TASK_PRIORITY    (tskIDLE_PRIORITY + 3)
 
