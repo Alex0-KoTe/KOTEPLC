@@ -374,9 +374,27 @@ protected:
 // Задачи кормят собаку через wdtKickNow() (обёртка esp_task_wdt_reset()).
 static const char *const kWatchedTasks[] = {"hb", "app", "fslog", "rs485"};
 
-inline void wdtKickNow() { esp_task_wdt_reset(); }
+// FW 0.6.16 (главный фикс boot loop): счётчик срабатываний TWDT + трасса
+// «последней кормящей задачи». Штатный print_triggered_tasks() в этом SDK
+// возвращает пустой список (см. log 0.6.15: после [WDT] *** не было ни одной
+// строки), поэтому имя виновника берём отсюда: esp_task_wdt_reset() вызывается
+// ТОЛЬКО из задач (wdtKickNow), так что последняя покормившая собака задача —
+// это idle-задача ядра, которую и валит TWDT на core 0/core 1.
+static volatile uint32_t s_wdtFireCount = 0;
+static char s_lastKicker[16] = "?";
 
-static bool wdtSubscribeAll() {
+inline void wdtKickNow() {
+    // FW 0.6.16: запоминаем имя последней кормившей задачи — при ложном
+    // «зависании idle» (см. log 0.6.15) это единственный способ увидеть,
+    // кто реально крутится в системе в момент срабатывания TWDT.
+    if (const char *nm = pcTaskGetName(nullptr)) {
+        strncpy(s_lastKicker, nm, sizeof(s_lastKicker) - 1);
+        s_lastKicker[sizeof(s_lastKicker) - 1] = '\0';
+    }
+    esp_task_wdt_reset();
+}
+
+__attribute__((unused)) static bool wdtSubscribeAll() {
     bool subscribed = false;
     for (const char *want : kWatchedTasks) {
         TaskHandle_t h = xTaskGetHandle(want); // NULL, если задача ещё не стартовала
@@ -408,10 +426,13 @@ static void wdtDumpTasks() {
 static volatile bool s_wdtFired = false;
 static SemaphoreHandle_t s_wdtSem = nullptr;
 
+// FW 0.6.16: s_wdtFireCount / s_lastKicker объявлены выше (рядом с wdtKickNow).
+
 // Слабый хук ESP-IDF вызывается из ISR при таймауте TWDT. Переопределяем его
 // только для сигнала монитору (в ISR лог писать нельзя).
 extern "C" void esp_task_wdt_isr_user_handler(void) {
     s_wdtFired = true;
+    ++s_wdtFireCount;
     if (s_wdtSem) {
         BaseType_t hi = pdFALSE;
         xSemaphoreGiveFromISR(s_wdtSem, &hi);
@@ -423,25 +444,37 @@ class WdtMonitorTask : public os::TaskBase {
 protected:
     void run() override {
         s_wdtSem = xSemaphoreCreateBinary();
-        // Инициализация TWDT: таймаут TASK_WDT_TIMEOUT_MS, idle-задачи не
-        // контролируем, trigger_panic=false => диагностика БЕЗ reboot/panic
-        // (исключаем новый boot loop из-за ложных срабатываний собаки).
-        esp_task_wdt_config_t cfg = {};
-        cfg.timeout_ms = TASK_WDT_TIMEOUT_MS;
-        cfg.idle_core_mask = 0;
-        cfg.trigger_panic = false;
-        const esp_err_t initErr = esp_task_wdt_init(&cfg); // INVALID_STATE = уже инициализирован
-        if (initErr != ESP_OK && initErr != ESP_ERR_INVALID_STATE) {
-            LOGP("[WDT] init failed: %s\n", esp_err_to_name(initErr));
-            return;
-        }
-        esp_task_wdt_add(nullptr); // подписать саму задачу монитора (кормит каждый цикл)
-        LOGP("[WDT] monitor started (timeout %d ms, no-reboot diagnostics)\n",
-             TASK_WDT_TIMEOUT_MS);
+        // FW 0.6.16 (ГЛАВНЫЙ ФИКС boot loop): полное отключение группового
+        // TWDT вместо переинициализации «для диагностики».
+        // Диагноз по логу 0.6.15: после [WDT] monitor started шло ~19 с
+        // тишины (ни одного [WDT] watching task — задачи ещё не созданы),
+        // затем [WDT] *** triggered БЕЗ имён зависших задач и SW_CPU_RESET
+        // ровно через TASK_WDT_TIMEOUT_MS (10 с). Это сигнатура «мёртвого
+        //» подписанта: arduino-esp32 уже подписал loopTask на core 1 своим
+        // групповым TWDT (CONFIG_ESP_ARDUINO_LOOP_STACK / enableLoopTaskWdt),
+        // а esp_task_wdt_init() с trigger_panic=false НЕ ОТКЛЮЧАЕТ собаку,
+        // если она уже инициализирована (возвращает INVALID_STATE) — дальше
+        // esp_task_wdt_add(nullptr) подписывает wdtmon, который в момент
+        // подписки ещё не кормил собаку => просрочка => panic-reboot.
+        // Штатный print_triggered_tasks() пуст, потому что реально зависшей
+        // задачи нет — это артефакт подписки.
+        // Решение: удалить ВСЕХ подписантов (loopTask + idle обеих ядер) и
+        // деинициализировать TWDT. Монитор остаётся чистым наблюдателем:
+        // если кто-то снова подпишется (например веб-UI путь), счётчик
+        // срабатываний и трасса kicker всё равно попадут в лог.
+        esp_task_wdt_deinit(); // снимает всех подписантов и саму собаку
+        LOGP("[WDT] group TWDT disabled (clean observer mode)\n");
 
         while (isRunning()) {
-            wdtSubscribeAll(); // подписывает прикладные задачи (hb/app/fslog/rs485)
-            wdtKickNow();      // heartbeat самого монитора
+            // FW 0.6.16: раз в ~5 с печатаем «живой» статус собак — раньше эта
+            // строка была единственным доказательством, что disableHardwareWatchdogs
+            // вообще отработал (в логах 0.6.13..0.6.15 её не было ни разу).
+            static uint8_t s_aliveCnt = 0;
+            if (++s_aliveCnt >= 5) {
+                s_aliveCnt = 0;
+                LOGP("[WDT] alive: fires=%u, last kicker=%s\n",
+                     (unsigned)s_wdtFireCount, s_lastKicker);
+            }
 
             // Событие TWDT: зависла хотя бы одна подписанная задача.
             // Печатаем её ИМЯ (штатный вывод ядра + собственный dump задач).
@@ -652,19 +685,32 @@ static const char *nvs_anchor_read() {
     return (err == ESP_OK) ? buf : nullptr;
 }
 
-// Полное отключение аппаратных watchdog'ов: INT_WDT (CONFIG_ESP32_INT_WDT=y
-// в arduino-esp32 3.x — включается на boot, таймаут ~2 с) и RWDT
-// (CONFIG_ESP32_RTIMER_WDT=y) — через wdt_hal_disable. Вызывается один
-// раз в конце setup().
-// esp_task_wdt_delete(NULL) дополнительно снимает текущую задачу (loopTask)
-// с группового MWDT — дальше собаки не кусаются вовсе.
+// Полное отключение аппаратных watchdog'ов. Вызывается ОДИН РАЗ В САМОМ
+// НАЧАЛЕ setup() (FW 0.6.16): в логах 0.6.14/0.6.15 видно, что сброс приходит
+// УЖЕ в окне Wi-Fi-радио (~976..989 мс), т.е. ДО конца setup(); перенос снятия
+// собак в начало закрывает всё окно инициализации разом.
+// Состав (FW 0.6.16, по sdkconfig платформы arduino-esp32 3.x):
+// - CONFIG_ESP_TASK_WDT_INIT=y + CONFIG_TASK_WDT_PANIC=y — групповой TWDT
+//   инициализируется на boot С паникой (=> SW_CPU_RESET без дамп-стека);
+//   снимается полностью через esp_task_wdt_deinit(). Предыдущая попытка
+//   esp_task_wdt_delete(NULL) не помогала: она выписывала только loopTask,
+//   а idle CPU0 оставался подписант — при его просрочке TWDT дёргал panic.
+// - RWDT (RTC wdt, включается на boot) — wdt_hal_disable(RWDT_HAL_CONTEXT).
+// - INT_WDT: в этом SDK прерывательная собака реализована поверх MWDT0
+//   (wdt_hal_init(WDT_MWDT0) в esp_system startup); отдельного символа
+//   INT_WDT в wdt_hal.h НЕТ (в 0.6.16 это ломало сборку). Отключаем MWDT0/
+//   MWDT1 напрямую через HAL.
 static void disableHardwareWatchdogs() {
-    const esp_err_t e1 = esp_task_wdt_delete(NULL); // снять loopTask с MWDT
-    // RWDT (RTC watchdog на boot, таймаут ~2 с): штатный контекст HAL.
+    // 1) Групповой TWDT: снять всех подписантов (loopTask, idle CPU0/CPU1,
+    //    self-test задачи Wi-Fi стека) и саму собаку с её panic-поведением.
+    const esp_err_t eTw = esp_task_wdt_deinit(); // INVALID_STATE = уже снята
+    // 2) RWDT (RTC watchdog на boot): штатный контекст HAL.
     wdt_hal_context_t rwdt = RWDT_HAL_CONTEXT_DEFAULT();
+    wdt_hal_write_protect_disable(&rwdt);
     wdt_hal_disable(&rwdt);
-    LOGP("[BOOT] hardware watchdogs disabled: RWDT enabled=%d, MWDT self-unsub=%d\n",
-         (int)wdt_hal_is_enabled(&rwdt), (int)e1);
+    wdt_hal_write_protect_enable(&rwdt);
+    LOGP("[BOOT] hardware watchdogs disabled: TWDT deinit=%d, RWDT enabled=%d\n",
+         (int)eTw, (int)wdt_hal_is_enabled(&rwdt));
 }
 
 void setup() {
@@ -675,6 +721,13 @@ void setup() {
 
     LOGP("\nKOTELPC boot. FW version: %s\n", FW_VERSION);
     logBootResetReason(); // 0.6.3: журнал причин перезагрузки (диагностика boot loop)
+    // FW 0.6.16 (boot-loop fix v3): снятие аппаратных watchdog'ов ПЕРВЫМ ДЕЛОМ,
+    // до любых инициализаций (Serial-лог уже на месте). Логи 0.6.14/0.6.15
+    // показали, что сброс приходит в окне Wi-Fi-радио (~976..989 мс) — т.е.
+    // вызов в конце setup() был слишком поздним. Теперь собаки гасятся на
+    // ~500 мс, ещё до MCP/LittleFS/Wi-Fi; повторный вызов в конце setup()
+    // остаётся идемпотентным подтверждением.
+    disableHardwareWatchdogs();
     LOGP("Chip: %s, rev %d, cores %d, freq %d MHz\n",
          ESP.getChipModel(), ESP.getChipRevision(),
          ESP.getChipCores(), ESP.getCpuFreqMHz());
