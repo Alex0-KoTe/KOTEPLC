@@ -214,6 +214,7 @@ protected:
                 cfg.wifiSsid = DEFAULT_WIFI_SSID;
                 cfg.wifiPassword = DEFAULT_WIFI_PASSWORD;
             }
+            dbgStepMark(9); // точка невозврата: начинаем поднимать радио
             g_wifi.begin(cfg.wifiSsid.c_str(), cfg.wifiPassword.c_str());
             dbgStepMark(7); // Wi-Fi радио стартовало без краха
             LOGP("[WIFI] ap=%s sta=%s ssid=\"%s\" ip=%s\n",
@@ -363,7 +364,9 @@ static const char *resetReasonName(int r) {
 // момента краха. Читаем её на каждом boot — получаем точную границу:
 // шаги <= last step выполнены, крах — между last step и следующим маркером.
 // Коды шагов: 1=pwr, 2=mcp, 3=rs485, 4=bridge, 5=littlefs, 6=tasks started,
-// 7=netboot wifi begin, 8=netboot web up. -1 (0xFF) = метки ещё нет.
+// 9=netboot start, 7=wifi begin DONE, 8=web up DONE. -1 (0xFF) = метки нет.
+// 0.6.5: маркер 9 пишется ПЕРЕД g_wifi.begin() — если при boot loop
+// last step=9, крах происходит внутри инициализации Wi-Fi-радио.
 static bool dbgNvsInit() {
     // nvs_flash_init идемпотентен; ESP_ERR_NVS_NEW_VERSION_FOUND /
     // NO_FREE_PAGES — стандартный путь Arduino: стирать и повторить.
@@ -406,8 +409,9 @@ static const char *dbgStepName(int s) {
         case 4:  return "uart bridge";
         case 5:  return "littlefs mount";
         case 6:  return "tasks started";
-        case 7:  return "netboot: wifi begin";
-        case 8:  return "netboot: web up";
+        case 7:  return "netboot: wifi begin OK";
+        case 8:  return "netboot: web up OK";
+        case 9:  return "netboot: START (wifi begin не завершён)";
         default: return "?";
     }
 }
