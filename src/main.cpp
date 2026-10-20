@@ -15,6 +15,8 @@
 
 #include <Arduino.h>
 #include <string.h>
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -40,6 +42,10 @@
 // каждая прикладная задача вызывает его в своём цикле; обёртка над
 // esp_task_wdt_reset() определена в секции WDT-монитора ниже.
 inline void wdtKickNow();
+
+// Маркер шагов инициализации (boot-loop bisect, 0.6.4) — определения ниже,
+// используются и в NetBootTask, и в setup().
+static void dbgStepMark(uint8_t step);
 
 // ---- Задача heartbeat: светодиод HEART на IO16, выход, 1 с вкл / 1 с выкл ----
 // Светодиод активный-низкий: включение = лог.0 на IO16 (драйвер сам инвертирует
@@ -209,6 +215,7 @@ protected:
                 cfg.wifiPassword = DEFAULT_WIFI_PASSWORD;
             }
             g_wifi.begin(cfg.wifiSsid.c_str(), cfg.wifiPassword.c_str());
+            dbgStepMark(7); // Wi-Fi радио стартовало без краха
             LOGP("[WIFI] ap=%s sta=%s ssid=\"%s\" ip=%s\n",
                  AP_SSID,
                  g_wifi.isConnected() ? "connected" : "down",
@@ -218,6 +225,7 @@ protected:
 
         // 2. Веб-интерфейс (порт 80): вкладки Сеть / Входы-Выходы / Файлы LittleFS
         web::start();
+        dbgStepMark(8); // веб-сервер поднялся без краха
 
         LOGP("[NET] network stack up, heap=%u\n", (unsigned)ESP.getFreeHeap());
         // Инициализация завершена — задача сама завершается (освобождает TCB и
@@ -349,11 +357,70 @@ static const char *resetReasonName(int r) {
     }
 }
 
+// ---- [DBG-STEP] Маркер шагов инициализации (FW 0.6.4, boot-loop bisect) ----
+// Сырая NVS-переменная (один u8) в namespace "koteldbg": запись дешёвая и
+// не зависит от LittleFS/stdio/Serial, поэтому метка доживает до самого
+// момента краха. Читаем её на каждом boot — получаем точную границу:
+// шаги <= last step выполнены, крах — между last step и следующим маркером.
+// Коды шагов: 1=pwr, 2=mcp, 3=rs485, 4=bridge, 5=littlefs, 6=tasks started,
+// 7=netboot wifi begin, 8=netboot web up. -1 (0xFF) = метки ещё нет.
+static bool dbgNvsInit() {
+    // nvs_flash_init идемпотентен; ESP_ERR_NVS_NEW_VERSION_FOUND /
+    // NO_FREE_PAGES — стандартный путь Arduino: стирать и повторить.
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        err = nvs_flash_init();
+    }
+    return err == ESP_OK;
+}
+
+static void dbgStepMark(uint8_t step) {
+    static bool nvsReady = dbgNvsInit();
+    if (!nvsReady) return;
+    nvs_handle_t h;
+    if (nvs_open("koteldbg", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "step", step);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static int dbgStepRead() {
+    if (!dbgNvsInit()) return -1;
+    nvs_handle_t h;
+    uint8_t v = 0xFF;
+    if (nvs_open("koteldbg", NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u8(h, "step", &v) != ESP_OK) v = 0xFF;
+        nvs_close(h);
+    }
+    return (v == 0xFF) ? -1 : (int)v;
+}
+
+static const char *dbgStepName(int s) {
+    switch (s) {
+        case -1: return "нет метки (первый запуск / стёртый NVS)";
+        case 1:  return "pwr on";
+        case 2:  return "mcp init";
+        case 3:  return "rs485 init";
+        case 4:  return "uart bridge";
+        case 5:  return "littlefs mount";
+        case 6:  return "tasks started";
+        case 7:  return "netboot: wifi begin";
+        case 8:  return "netboot: web up";
+        default: return "?";
+    }
+}
+
 static void logBootResetReason() {
     const int r = (int)esp_reset_reason();
     LOGP("[BOOT] reset reason: %d = %s\n", r, resetReasonName(r));
     LOGP("[BOOT] heap=%u, maxblock=%u\n",
          (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+    // 0.6.4: последний завершённый шаг инициализации ПРЕДЫДУЩего запуска.
+    // Если boot loop остаётся — по этому коду сразу видно, на каком шаге
+    // происходит крах (см. таблицу шагов у dbgStepMark()).
+    LOGP("[BOOT] last step=%d (%s)\n", dbgStepRead(), dbgStepName(dbgStepRead()));
 }
 
 void setup() {
@@ -382,6 +449,14 @@ void setup() {
     hal::gpioWrite(static_cast<int>(GpioPin::PERIPH_EN), true);
     delay(PERIPH_POWER_STABLE_MS);
     LOGP("[PWR] PERIPH_EN (IO4) = 1, periphery power on\n");
+
+    // [DBG-STEP] Маркер последнего успешного шага инициализации (FW 0.6.4).
+    // Пишется в NVS СЫРЫМ u8 (nvs_set_u8, без littlefs/stdio) — предельно
+    // безопасно и доживает до момента краха. Если boot loop повторяется,
+    // строка "[BOOT] last step=<код>" на следующем старте точно укажет шаг,
+    // который НЕ завершился: 1=pwr, 2=mcp, 3=rs485, 4=bridge, 5=littlefs,
+    // 6=tasks started, 7=netboot wifi, 8=netboot web up. -1 = метки нет.
+    dbgStepMark(1);
 
     // 1b. Расширитель GPIO MCP23017 по I2C (шина/адрес/порты — в mcp23017_config.h)
     //     Инициализация с повторными попытками: чипу после включения питания
@@ -416,24 +491,45 @@ void setup() {
              "        Проверьте: питание периферии (IO4), SDA=IO21/SCL=IO22,\n"
              "        подтяжки 4.7k к +3V3 на SDA/SCL, монтаж микросхемы.\n");
     }
+    dbgStepMark(2);
 
     // 1c. Канал RS485: UART + RE/DE (конфигурация — rs485_config.h).
-    //     Arduino HWSerial (Serial) использует UART0 — освобождаем порт
-    //     перед установкой driver/uart поверх тех же пинов.
-    Serial.end();
+    //
+    // !!! КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ BOOT LOOP (FW 0.6.4) !!!
+    // Транслятор RS485 висит на UART0 (IO1=TX, IO3=RX) — это ОТОТ ЖЕ сам
+    // отладочный порт Serial, через который печатается весь лог. В 0.6.x
+    // здесь вызывались Serial.end() + hal::rsInit(), которые перепривязывали
+    // UART0 к драйверу RS485, после чего макрос LOGP продолжал писать в
+    // объект Serial поверх занятого порта: TX-поток Arduino-Serial ломался,
+    // в порт сыпало мусором (сплошная строка «\xFF\xFF...» прямо перед
+    // «ets Jul 29 2019 ... rst:0xC SW_CPU_RESET» в логе пользователя), а
+    // следом падала инициализация сети — классический boot loop.
+    // Теперь: Serial НЕ освобождается вовсе; как только драйвер RS485 захватил
+    // UART0, все логи немедленно переводятся в шину RS485 (hal::uartBridgeInit
+    // + hal::logPrint), и объект Serial больше не используется никогда.
+    // Управление мостом: UART_BRIDGE_TO_RS485 (project_config.h):
+    //   1 = логи/ввод в шину RS485 (по умолчанию с 0.6.4);
+    //   0 = логи остаются в Serial — но это НЕБЕЗОПАСНО, пока UART0 занят
+    //       драйвером RS485 (двойное владение портом), используйте только
+    //       если транслятор физически отключён.
     if (hal::rsInit()) {
 #if RS485_START_MODBUS
         hal::rsSetMode(RsMode::MODBUS_RTU);
 #endif
-        LOGP("[RS485] ready @%u baud, mode=%s\n",
-             (unsigned)rs485_config::BAUD_RATE,
-             hal::rsMode() == RsMode::MODBUS_RTU ? "MODBUS_RTU" : "SIMPLE_UART");
+        // Мост логов/ввода: теперь все LOGP/hal::logPrint идут через
+        // выбранный канал; по умолчанию — шина RS485 (UART0 занят драйвером).
+        hal::uartBridgeInit(UART_BRIDGE_TO_RS485 != 0);
+        dbgStepMark(3);
+        hal::logPrint("[RS485] ready @%u baud, mode=%s\n",
+                      (unsigned)rs485_config::BAUD_RATE,
+                      hal::rsMode() == RsMode::MODBUS_RTU ? "MODBUS_RTU" : "SIMPLE_UART");
     } else {
-        LOGP("[FATAL] RS485 driver init failed\n");
+        // UART0 НЕ захвачен драйвером — Serial остаётся живым и безопасным.
+        hal::uartBridgeInit(false);
+        dbgStepMark(3);
+        hal::logPrint("[FATAL] RS485 driver init failed\n");
     }
-    // Мост логов/ввода: отладочный вывод можно перенаправить в шину RS485
-    // (hal::uartToRs485(true)) или вернуть в Serial (hal::uartToRs485(false)).
-    hal::uartBridgeInit(UART_BRIDGE_TO_RS485);
+    dbgStepMark(4);
 
     // 2. LittleFS (раздел "storage" из partitions.csv)
     if (!fs::FsDriver::instance().begin(true)) {
@@ -442,6 +538,7 @@ void setup() {
         fs::FsDriver::instance().mkdir("/log");
         fs::FsDriver::instance().mkdir("/www");   // каталог файлов веб-интерфейса
     }
+    dbgStepMark(5);
 
     // 2a/2b. Wi-Fi и веб-сервер — НЕ в setup(): инициализация сетевого стека
     //     (WiFi AP+STA, lwIP, ESPAsyncWebServer) перенесена в отдельную
@@ -461,6 +558,7 @@ void setup() {
     //    просрочке heartbeat позволяет ядру напечатать имя зависшей задачи.
     wdtMonTask.start(os::TaskBase::Config{"wdtmon", 3072, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
 
+    dbgStepMark(6);
     LOGP("[MAIN] tasks started\n");
 }
 

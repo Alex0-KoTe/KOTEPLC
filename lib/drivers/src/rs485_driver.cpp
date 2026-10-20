@@ -204,9 +204,15 @@ size_t Rs485Driver::receiveFrame(uint8_t *buf, size_t maxLen, uint32_t timeoutMs
     }
 
     if (echo_ && got > 0) {
-        Serial.printf("[RS485:%s] %u bytes:", modbus ? "MB" : "RAW", (unsigned)got);
-        for (size_t i = 0; i < got && i < 32; ++i) Serial.printf(" %02X", buf[i]);
-        Serial.println();
+        // Echo через ESP_LOGx, а НЕ через Serial: UART0 захвачен этим же
+        // драйвером (boot-loop fix 0.6.4 — двойное владение портом).
+        char hexb[96];
+        int off = 0;
+        for (size_t i = 0; i < got && i < 32 && off < (int)sizeof(hexb) - 4; ++i) {
+            off += snprintf(hexb + off, sizeof(hexb) - off, " %02X", buf[i]);
+        }
+        hexb[off] = '\0';
+        ESP_LOGI(RS_TAG, "rx %s %u bytes:%s", modbus ? "MB" : "RAW", (unsigned)got, hexb);
     }
     releaseLock();
     return got;

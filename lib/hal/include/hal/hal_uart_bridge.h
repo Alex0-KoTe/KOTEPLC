@@ -36,13 +36,15 @@ size_t inputPoll(uint8_t *buf, size_t maxLen); // >0: прочитано, 0: н�
 // 0.6.3: добавлен flush() — при boot loop последние строки перед крахом
 // терялись в TX-буфере UART и диагностика была невозможна; теперь каждая
 // запись немедленно уходит в порт (журнал полного цикла перезагрузок).
-// Примечание: в режиме моста "логи -> шина RS485" (hal::uartToRs485(true))
-// прямой вывод идёт в отладочный Serial; для отправки логов в шину
-// используйте hal::logPrint() явно.
+// Примечание: после захвата UART0 драйвером RS485 (hal::rsInit()) прямой
+// вывод Serial.printf в отладочный порт НЕБЕЗОПАСЕН — портом владеет другой
+// драйвер (двойное владение = мусор в потоке, см. boot-loop fix 0.6.4).
+// В этом режиме LOGP перенаправляется в шину RS485 через hal::logPrint()
+// (мост включается вызовом hal::uartBridgeInit(true) сразу после rsInit()).
 #define LOGP(...)        \
     do {                 \
-        Serial.printf(__VA_ARGS__); \
-        Serial.flush();  \
+        if (hal::uartIsRs485()) { hal::logPrint(__VA_ARGS__); } \
+        else { Serial.printf(__VA_ARGS__); Serial.flush(); } \
     } while (0)
 
 #endif // HAL_UART_BRIDGE_H

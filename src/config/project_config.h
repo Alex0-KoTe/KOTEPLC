@@ -12,7 +12,7 @@
 #define DEFAULT_WIFI_PASSWORD ""
 
 // Версия прошивки
-#define FW_VERSION "0.6.3"
+#define FW_VERSION "0.6.4"
 
 // ---- Boot-loop fix (0.6.2/0.6.3): Wi-Fi + веб-сервер в отдельной задаче ----
 // Инициализация стека Wi-Fi (lwIP/wpa_supplicant) и AsyncWebServer требует
@@ -79,7 +79,12 @@
 #define RS485_START_MODBUS        0
 // Таймаут ожидания ответа/кадра Modbus, мс
 #define MODBUS_RESP_TIMEOUT_MS    500
-// Куда идут логи/ввод после старта: 0 = Serial (отладка), 1 = шина RS485
-#define UART_BRIDGE_TO_RS485      0
+// Куда идут логи/ввод после старта: 0 = Serial (отладка), 1 = шина RS485.
+// ВНИМАНИЕ (boot-loop fix 0.6.4): значение по умолчанию — 1, потому что
+// транслятор RS485 физически висит на UART0 = отладочный Serial. После
+// hal::rsInit() портом владеет драйвер RS485; писать в тот же UART через
+// объект Serial нельзя (двойное владение = мусор в потоке и boot loop).
+// 0 допустимо ТОЛЬКО если RS485-транслятор физически отключён/не инициализирован.
+#define UART_BRIDGE_TO_RS485      1
 
 #endif // PROJECT_CONFIG_H
