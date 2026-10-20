@@ -47,6 +47,10 @@ inline void wdtKickNow();
 // используются и в NetBootTask, и в setup().
 static void dbgStepMark(uint8_t step);
 
+// Инициализация канала RS485 (FW 0.6.7: вынесена из setup() и вызывается
+// ПОСЛЕ старта сети; определение — после объявлений задач ниже).
+static void initRs485Channel();
+
 // ---- Задача heartbeat: светодиод HEART на IO16, выход, 1 с вкл / 1 с выкл ----
 // Светодиод активный-низкий: включение = лог.0 на IO16 (драйвер сам инвертирует
 // полярность по флагу activeLow в gpio_config.h). Период задаётся
@@ -353,6 +357,37 @@ static NetBootTask netBootTask;    // опция: Wi-Fi + веб-сервер в
 #endif
 static WdtMonitorTask wdtMonTask;  // диагностика зависаний по имени задачи
 
+// ---- Канал RS485: UART1 + RE/DE (конфигурация — rs485_config.h) ----------
+// FW 0.6.7: вынесено из середины setup() в отдельную функцию и вызывается
+// ПОСЛЕ старта Wi-Fi/веб-сервера (RS485_INIT_AFTER_WIFI=1). Диагноз boot loop
+// 0.6.2..0.6.6: крах ВСЕГДА случался в окне между "[MCP] online" и стартом
+// радио, т.е. внутри hal::rsInit() — driver/uart-аллокации + привязка UART1
+// к IO1/IO3 (пины Console-UART ROM-загрузчика). Сторонняя прошивка без
+// RS485-драйвера поднимает AP безупречно — ранняя инициализация UART была
+// единственной лишней операцией. Теперь радио стартует «чистым» запуском,
+// а RS485 инициализируется после сети и при неудаче не блокирует систему.
+// Прошивка пишет логи в Serial/UART0 (0.6.5+), драйвер RS485 сидит на UART1 —
+// двойного владения портом нет. Мост логов в шину: UART_BRIDGE_TO_RS485=1.
+static void initRs485Channel() {
+    if (hal::rsInit()) {
+#if RS485_START_MODBUS
+        hal::rsSetMode(RsMode::MODBUS_RTU);
+#endif
+        hal::uartBridgeInit(UART_BRIDGE_TO_RS485 != 0);
+        dbgStepMark(3);
+        hal::logPrint("[RS485] ready @%u baud, mode=%s\n",
+                      (unsigned)rs485_config::BAUD_RATE,
+                      hal::rsMode() == RsMode::MODBUS_RTU ? "MODBUS_RTU" : "SIMPLE_UART");
+    } else {
+        // Драйвер НЕ захватил порт — Serial остаётся единственным каналом
+        // логов; система продолжает работу без RS485 (non-blocking).
+        hal::uartBridgeInit(false);
+        dbgStepMark(3);
+        hal::logPrint("[WARN] RS485 driver init failed (channel disabled)\n");
+    }
+    dbgStepMark(4);
+}
+
 // Причина последней перезагрузки (0.6.3): при boot loop без этой строки
 // невозможно отличить крах прошивки от сбоя питания. esp_reset_reason()
 // возвращает код причины (RST_REASON_*: PANIC / INT_WDT / TASK_WDT /
@@ -515,45 +550,7 @@ void setup() {
     }
     dbgStepMark(2);
 
-    // 1c. Канал RS485: UART + RE/DE (конфигурация — rs485_config.h).
-    //
-    // !!! КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ BOOT LOOP (FW 0.6.4) !!!
-    // Транслятор RS485 висит на UART0 (IO1=TX, IO3=RX) — это ОТОТ ЖЕ сам
-    // отладочный порт Serial, через который печатается весь лог. В 0.6.x
-    // здесь вызывались Serial.end() + hal::rsInit(), которые перепривязывали
-    // UART0 к драйверу RS485, после чего макрос LOGP продолжал писать в
-    // объект Serial поверх занятого порта: TX-поток Arduino-Serial ломался,
-    // в порт сыпало мусором (сплошная строка «\xFF\xFF...» прямо перед
-    // «ets Jul 29 2019 ... rst:0xC SW_CPU_RESET» в логе пользователя), а
-    // следом падала инициализация сети — классический boot loop.
-    // Теперь: Serial НЕ освобождается вовсе; как только драйвер RS485 захватил
-    // UART0, все логи немедленно переводятся в шину RS485 (hal::uartBridgeInit
-    // + hal::logPrint), и объект Serial больше не используется никогда.
-    // Управление мостом: UART_BRIDGE_TO_RS485 (project_config.h):
-    //   1 = логи/ввод в шину RS485 (по умолчанию с 0.6.4);
-    //   0 = логи остаются в Serial — но это НЕБЕЗОПАСНО, пока UART0 занят
-    //       драйвером RS485 (двойное владение портом), используйте только
-    //       если транслятор физически отключён.
-    if (hal::rsInit()) {
-#if RS485_START_MODBUS
-        hal::rsSetMode(RsMode::MODBUS_RTU);
-#endif
-        // Мост логов/ввода: теперь все LOGP/hal::logPrint идут через
-        // выбранный канал; по умолчанию — шина RS485 (UART0 занят драйвером).
-        hal::uartBridgeInit(UART_BRIDGE_TO_RS485 != 0);
-        dbgStepMark(3);
-        hal::logPrint("[RS485] ready @%u baud, mode=%s\n",
-                      (unsigned)rs485_config::BAUD_RATE,
-                      hal::rsMode() == RsMode::MODBUS_RTU ? "MODBUS_RTU" : "SIMPLE_UART");
-    } else {
-        // UART0 НЕ захвачен драйвером — Serial остаётся живым и безопасным.
-        hal::uartBridgeInit(false);
-        dbgStepMark(3);
-        hal::logPrint("[FATAL] RS485 driver init failed\n");
-    }
-    dbgStepMark(4);
-
-    // 2. LittleFS (раздел "storage" из partitions.csv)
+    // 1c. LittleFS (раздел "storage" из partitions.csv)
     if (!fs::FsDriver::instance().begin(true)) {
         LOGP("[WARN] LittleFS mount failed\n");
     } else {
@@ -562,19 +559,36 @@ void setup() {
     }
     dbgStepMark(5);
 
-    // 2a/2b. Wi-Fi и веб-сервер (0.6.6): старт СИНХРОННО в setup(), до
-    //      прикладных задач. В 0.6.2..0.6.5 для этого поднималась задача
-    //      "netboot" со статическим стеком 8 КБ и приоритетом выше wifi task;
-    //      boot loop при этом остался, а диагностика «last step=7» оказалась
-    //      ложной (маркер писался только ПОСЛЕ успешного begin()). now:
-    //      маркер 10 пишется ПЕРЕД включением радио — при краху внутри
-    //      WiFi.mode()/softAP() в логе будет ровно last step=10.
-    //      Опция возврата к задачному пути: -DNET_BOOT_USE_TASK=1.
+    // 1d. Wi-Fi и веб-сервер (0.6.7): старт СИНХРОННО в setup() — ДО канала
+    //     RS485. Порядок 0.6.2..0.6.6 (rsInit -> littlefs -> wifi) давал
+    //     гарантированный boot loop: крах происходил сразу после [MCP] online,
+    //     т.е. ВНУТРИ hal::rsInit() (driver/uart-аллокации + привязка UART1 к
+    //     IO1/IO3 — пинам Console-UART ROM-загрузчика). Сторонняя прошивка без
+    //     RS485-драйвера работает с AP идеально — значит проблема в ранней
+    //     инициализации UART, а не в радио. Радио теперь поднимается «чистым»
+    //     стартом, как в рабочей прошивке; маркер 10 пишется ПЕРЕД включением
+    //     радио — при крахе внутри WiFi.mode()/softAP() в логе будет ровно
+    //     last step=10. Опция возврата к задачному пути: -DNET_BOOT_USE_TASK=1.
+#if !RS485_INIT_AFTER_WIFI
+    // A/B-эксперимент: старый порядок — сначала RS485, потом сеть.
+    initRs485Channel();
+#endif
 #if NET_BOOT_USE_TASK
     netBootTask.start(os::TaskBase::Config{
         "netboot", NET_BOOT_TASK_STACK_BYTES, NET_BOOT_TASK_PRIORITY, tskNO_AFFINITY});
 #else
     startNetworkStack();
+#endif
+#if RS485_INIT_AFTER_WIFI
+    // 1e. Канал RS485: UART1 + RE/DE (конфигурация — rs485_config.h).
+    //     ИНИЦИАЛИЗИРУЕТСЯ ПОСЛЕ Wi-Fi (см. комментарий выше): драйвер
+    //     поднимается на UART1 (НЕ UART0!) и при неудаче не блокирует систему.
+    //     Прошивка (0.6.5+) пишет логи в Serial/UART0; RS485 сидит на своих
+    //     IO1/IO3 через UART1 — двойного владения портом больше нет.
+    //     Управление мостом логов: UART_BRIDGE_TO_RS485 (project_config.h):
+    //       0 = логи остаются в Serial (по умолчанию, безопасно: UART0 свободен);
+    //       1 = логи/ввод гоняются по шине RS485 (для удалённой диагностики).
+    initRs485Channel();
 #endif
 
     // 3. Прикладные FreeRTOS-задачи

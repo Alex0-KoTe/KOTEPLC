@@ -10,6 +10,8 @@
 #include <string.h>
 #include "driver/gpio.h"
 #include "driver/uart.h"
+#include "soc/gpio_periph.h"   // DR_REG_GPIO_BASE — адрес GPIO.matrix (прямая перепривязка сигналов)
+
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -65,6 +67,26 @@ bool Rs485Driver::init() {
 #endif
 
     esp_err_t err = uart_param_config(UART_PORT, &cfg);
+    // !!! КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ BOOT LOOP (FW 0.6.7) !!!
+    // IO1/IO3 физически подключены к транслятору RS485, но это ОНИ ЖЕ пины
+    // Console-UART (UART0), которые ROM-загрузчик и Arduino core привязывают
+    // к UART0 при каждом сбросе. Простой uart_set_pin(UART1, 1, 3) оставлял
+    // матричные MODE обоих пинов в SIGNAL_MODE_UART0: UART1 не получал линию,
+    // а следующий reset уходил в SW_CPU_RESET ещё до вывода лога (boot loop
+    // 0.6.2..0.6.6; сторонняя прошивка без RS485-драйвера работает идеально).
+    // Теперь драйвер ЯВНО перепрошивает GPIO.matrix: OUT-сигнал пина N —
+    // регистр matrix+0x2800+N*4, IN-сигнал пина N — matrix+0x3000+N*4
+    // (те же адреса, что использует esp32-hal-gpio.c из состава ядра).
+    constexpr uint32_t kMatrixBase = DR_REG_GPIO_BASE + 0x200U;
+    // Битовые поля matrix-регистров ESP32 (esp-idf: soc/esp32/io_matrix.h):
+    // бит 31 — направление сигнала, младшие 9 бит — номер сигнала.
+    constexpr uint32_t kMatrixOutput = 1U << 31; // OUT-MUX активен
+    constexpr uint32_t kMatrixInput  = 1U << 30; // IN-MUX активен
+    volatile uint32_t *outMux = (volatile uint32_t *)(kMatrixBase + 0x2800U + (uint32_t)PIN_TX * 4U);
+    volatile uint32_t *inMux  = (volatile uint32_t *)(kMatrixBase + 0x3000U + (uint32_t)PIN_RX * 4U);
+    // Нумерация сигналов: SOC_UART_SIGNAL_START(=8) + номер UART => U1TXD=9, U1RXD=10
+    *outMux = 9U | kMatrixOutput; // IO1 -> U1TXD, направление OUT
+    *inMux  = 10U | kMatrixInput; // IO3 -> U1RXD, направление IN
     if (err == ESP_OK) err = uart_set_pin(UART_PORT, PIN_TX, PIN_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err == ESP_OK) err = uart_driver_install(UART_PORT, RX_BUF_SIZE, TX_BUF_SIZE, 0, nullptr, 0);
     if (err != ESP_OK) {
