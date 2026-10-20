@@ -12,7 +12,7 @@
 #define DEFAULT_WIFI_PASSWORD ""
 
 // Версия прошивки
-#define FW_VERSION "0.6.17"
+#define FW_VERSION "0.6.18"
 
 // ---- Boot-loop fix 0.6.17: эксперимент «минимальный путь» (A/B с эталоном) ----
 // Логи 0.6.14..0.6.16: сброс (SW_CPU_RESET) приходит СИНХРОННО сразу после

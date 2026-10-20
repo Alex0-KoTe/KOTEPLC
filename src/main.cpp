@@ -393,7 +393,14 @@ inline void wdtKickNow() {
         strncpy(s_lastKicker, nm, sizeof(s_lastKicker) - 1);
         s_lastKicker[sizeof(s_lastKicker) - 1] = '\0';
     }
-    esp_task_wdt_reset();
+    // FW 0.6.18 (ГЛАВНЫЙ ФИКС boot loop): собака снята с системы ещё в самом
+    // начале setup() (disableHardwareWatchdogs -> esp_task_wdt_deinit), поэтому
+    // здесь НЕ вызываем esp_task_wdt_reset(): в логах exp2/0.6.17 он печатал
+    // «E task_wdt: esp_task_wdt_reset(698): TWDT was never initialized» каждые
+    // ~2 мс (спам от rs485-задачи). Сброс на exp2 шёл ПОСЛЕ этого спама и без
+    // dump'а регистров — т.е. это НЕ panic от нашей кодовой базы; по метке
+    // last step=6 exp2 доходил до конца своей укороченной финализации.
+    // Оставляем только трассировку kicker (безопасно, не дёргает WDT API).
 }
 
 __attribute__((unused)) static bool wdtSubscribeAll() {
@@ -911,27 +918,33 @@ void setup() {
     // вырезано. Проживёт >10 с — виновник гарантированно в отключённых
     // блоках (бисектим по одному); нет — остаётся питание (brownout при
     // пике тока радио ~240 мА). Возврат к полному пути: =0.
-#if BOOT_MINIMAL_EXPERIMENT
+#if BOOT_MINIMAL_EXPERIMENT && BOOT_MINIMAL_EXPERIMENT <= 2
     // FW 0.6.17 v2: питание ИСКЛЮЧЕНО пользователем — на этом железе другая
     // прошивка с Wi-Fi работает без сбоя. Значит сброс — программный и
     // синхронный (ESP.restart()/abort в нашем коде), а не brownout.
-    // Эксперимент разбит на два шага, чтобы найти виновника за один прогон:
+    // Эксперимент разбит на шаги, чтобы найти виновника (см. platformio.ini):
     //   =1 — только радио (AP): всё остальное вырезано;
-    //   =2 — радио + все прикладные задачи, НО БЕЗ web::start() и финальных
-    //        NVS-записей. Проживёт >30 с — виновник web::start()/AsyncTCP или
-    //        финализация setup(); умрёт — одна из задач (hb/app/fslog/rs485/
-    //        wdtmon) или их взаимодействие с сетевым стеком.
-    LOGP("[BOOT] MINIMAL EXPERIMENT BUILD: skipping RS485/tasks/web/NVS tail of setup().\n");
+    //   =2 — радио + все прикладные задачи, НО БЕЗ web::start();
+    //   =3 — полный путь ДО web::start(), но БЕЗ прикладных задач (ниже).
+    LOGP("[BOOT] MINIMAL EXPERIMENT BUILD=%d: tail of setup() modified.\n",
+         BOOT_MINIMAL_EXPERIMENT);
     LOGP("[BOOT] If no reset within ~10s -> culprit is in the skipped blocks (bisect next).\n");
-#if BOOT_MINIMAL_EXPERIMENT >= 2
+#if BOOT_MINIMAL_EXPERIMENT == 2
     heartbeatTask.start(os::TaskBase::Config{"hb", 3072, tskIDLE_PRIORITY + 1, 0});
     appLogicTask.start(os::TaskBase::Config{"app", 3072, tskIDLE_PRIORITY + 2, 0});
     fsLogTask.start(os::TaskBase::Config{"fslog", 4096, tskIDLE_PRIORITY + 1, 0});
     rs485Task.start(os::TaskBase::Config{"rs485", 4096, tskIDLE_PRIORITY + 2, 0});
     wdtMonTask.start(os::TaskBase::Config{"wdtmon", 3072, tskIDLE_PRIORITY + 1, 0});
     dbgStepMark(6);
-    LOGP("[BOOT] EXPERIMENT=2: tasks started, NO web::start(), NO NVS finalization.\n");
-    LOGP("[BOOT] Survived >30s -> culprit is web::start()/finalization; reset -> a task.\n");
+    // FW 0.6.18: в exp2 теперь тоже ставим якорь и пишем step=12 — после
+    // фикса wdtKickNow записи NVS переживают сброс. Проживёт >30 с — виновник
+    // web::start(); умрёт со «last step=12» на следующем boot — виновник одна
+    // из задач/их взаимодействие (следующий шаг бисекции — отключать по одной).
+    disableHardwareWatchdogs();
+    dbgStepMark(12);
+    nvs_anchor_setup_ok();
+    LOGP("[BOOT] EXPERIMENT=2: tasks started, NO web::start(); anchor+step12 written.\n");
+    LOGP("[BOOT] Survived >30s -> culprit is web::start(); reset -> a task (see last step).\n");
 #endif
     return;
 #endif
@@ -948,6 +961,20 @@ void setup() {
 #endif
 
     // 3. Прикладные FreeRTOS-задачи
+    // FW 0.6.18 (exp=3): зеркальный эксперимент к exp2 — web::start() БЕЗ
+    // прикладных задач. Позволяет за один прогон отличить «виновник веб-стек
+    // (AsyncTCP/lwIP listen)» от «виновник задачи». Сборка: -t upload с
+    // флагом -DBOOT_MINIMAL_EXPERIMENT=3 (среда esp32dev_exp3).
+#if BOOT_MINIMAL_EXPERIMENT == 3
+    initRs485Channel();
+    web::start();
+    disableHardwareWatchdogs();
+    dbgStepMark(14);
+    nvs_anchor_setup_ok();
+    LOGP("[BOOT] EXPERIMENT=3: web::start() ran, NO app tasks; anchor+step14 written.\n");
+    LOGP("[BOOT] Survived >30s -> culprit is a task; reset -> web::start()/AsyncTCP.\n");
+    return;
+#endif
     // FW 0.6.15 (bisect): маркер 15 — точка между web::start() и созданием
     // задач; вместе с 14 даёт трёхточечную бисекцию пост-сетевого окна.
     dbgStepMark(15);
