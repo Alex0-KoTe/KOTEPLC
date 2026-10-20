@@ -306,12 +306,15 @@ static void startNetworkStack() {
         });
         s_apEvtRegistered = true;
     }
-    // Дождаться диспатча AP_START из контекста loopTask (WiFi.run() гоняет
-    // очередь событий esp_wifi -> Arduino). Таймаут НЕ фатален: прайминг
-    // tcpip_thread (шаг 3) уже выполнен, сеть работоспособна.
+    // Дождаться диспатча AP_START в очереди событий esp_event. В этой сборке
+    // Arduino-core 3.x у WiFiClass НЕТ метода run(): события доставляются
+    // напрямую из esp_event_default_loop (_arduino_event_cb -> onEvent),
+    // поэтому достаточно короткого ожидания под vTaskDelay — ядро-владелец
+    // цикла событий крутится на системном стеке и обработчик сработает сам.
+    // Таймаут НЕ фатален: прайминг tcpip_thread (шаг 3) уже выполнен, сеть
+    // работоспособна.
     for (int i = 0; i < 20 && !s_tcpipReady; ++i) {
-        WiFi.run(); // диспатч ARDUINO_EVENT_WIFI_AP_START -> s_tcpipReady
-        vTaskDelay(pdMS_TO_TICKS(25));
+        vTaskDelay(pdMS_TO_TICKS(25)); // ждём delivery AP_START -> s_tcpipReady
     }
     LOGP("[NET] tcpip ready flag=%d (set by %s)\n", (int)s_tcpipReady,
          s_tcpipReady ? "AP_START" : "timeout, netif-up fallback holds");
@@ -737,11 +740,11 @@ void loop() {
     // контекста loopTask (ядро Arduino): сторонние задачи, дёргающие
     // WiFi.begin()/mode(), ломали блокировки ядра TCP/IP — крах
     // "assert failed: tcp_alloc ... Required to lock TCPIP core".
-    // FW 0.6.12: диспатч WiFi-событий из контекста loopTask — событие
-    // ARDUINO_EVENT_WIFI_AP_START (и все последующие STA/AP-события)
-    // устанавливает s_tcpipReady; без этого вызова очередь событий
-    // esp_wifi осталась бы непрочищенной после стартапа.
-    WiFi.run();
+    // FW 0.6.12: диспатч WiFi-событий выполняется автоматически ядром
+    // esp_event (_arduino_event_cb -> обработчик WiFi.onEvent); метод
+    // WiFi.run() в Arduino-core 3.x отсутствует — отдельный вызов из
+    // loopTask не требуется, событие ARDUINO_EVENT_WIFI_AP_START (и все
+    // последующие STA/AP-события) устанавливает s_tcpipReady сам.
     web::handleLoopTick();
     vTaskDelay(pdMS_TO_TICKS(10));
 }
