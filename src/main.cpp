@@ -198,41 +198,55 @@ protected:
 // FreeRTOS-задаче с увеличенным статическим стеком 8 КБ; стек задачи
 // защищён MPU-stack overflow detection (при переполнении — чёткий дамп с
 // именем "netboot", а не тихая порча памяти setup()).
+// 0.6.6: тело задачи вынесено в обычную функцию, которую setup() вызывает
+// ПРЯМО (в контексте loopTask). Причина: маркер «last step=7» в boot loop
+// был ложным — он писался ПОСЛЕ успешного begin(), то есть показывал результат
+// ПРЕДЫДУЩего цикла, а крах происходил ВНУТРИ WiFi.mode()/softAP(). Заодно
+// убран конкурент netboot со стеком 8 КБ и приоритетом выше wifi task —
+// на старте радио такая связка деградировала Wi-Fi-стек.
+static void startNetworkStack() {
+    LOGP("[NET] network init start (heap=%u, maxblock=%u)\n",
+         (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+
+    // 1. Wi-Fi: настройки из NVS (ConfigService); при пустом SSID или неудаче —
+    //    точка доступа KOTELPC-AP / 12345678 (http://192.168.4.1/).
+    //    Режим постоянный AP+STA (радио этой платы работает только с AP).
+    {
+        ConfigService svc;
+        DeviceConfig cfg;
+        if (!svc.load(cfg)) {
+            cfg.wifiSsid = DEFAULT_WIFI_SSID;
+            cfg.wifiPassword = DEFAULT_WIFI_PASSWORD;
+        }
+        dbgStepMark(10); // точка невозврата: СЕЙЧАС поднимаем радио (Wi-Fi ON)
+        g_wifi.begin(cfg.wifiSsid.c_str(), cfg.wifiPassword.c_str());
+        dbgStepMark(7); // Wi-Fi радио стартовало без краха
+        LOGP("[WIFI] ap=%s sta=%s ssid=\"%s\" ip=%s\n",
+             AP_SSID,
+             g_wifi.isConnected() ? "connected" : "down",
+             g_wifi.currentSsid().c_str(),
+             g_wifi.localIP().c_str());
+    }
+
+    // 2. Веб-интерфейс (порт 80): вкладки Сеть / Входы-Выходы / Файлы LittleFS
+    web::start();
+    dbgStepMark(8); // веб-сервер поднялся без краха
+
+    LOGP("[NET] network stack up, heap=%u\n", (unsigned)ESP.getFreeHeap());
+}
+
+// Старый netboot-задачный путь (0.6.2..0.6.5) оставлен как опция: сборка с
+// -DNET_BOOT_USE_TASK=1 вернёт старт сети в отдельной задаче. По умолчанию
+// с 0.6.6 сеть стартует синхронно в setup() (см. startNetworkStack()).
+#ifndef NET_BOOT_USE_TASK
+#define NET_BOOT_USE_TASK 0
+#endif
+#if NET_BOOT_USE_TASK
 class NetBootTask : public os::TaskBase {
 protected:
-    void run() override {
-        LOGP("[NET] netboot task started (stack %d B, heap=%u)\n",
-             NET_BOOT_TASK_STACK_BYTES, (unsigned)ESP.getFreeHeap());
-
-        // 1. Wi-Fi: настройки из NVS (ConfigService); при пустом SSID или неудаче —
-        //    точка доступа KOTELPC-AP / 12345678 (http://192.168.4.1/).
-        //    Режим постоянный AP+STA (радио этой платы работает только с AP).
-        {
-            ConfigService svc;
-            DeviceConfig cfg;
-            if (!svc.load(cfg)) {
-                cfg.wifiSsid = DEFAULT_WIFI_SSID;
-                cfg.wifiPassword = DEFAULT_WIFI_PASSWORD;
-            }
-            dbgStepMark(9); // точка невозврата: начинаем поднимать радио
-            g_wifi.begin(cfg.wifiSsid.c_str(), cfg.wifiPassword.c_str());
-            dbgStepMark(7); // Wi-Fi радио стартовало без краха
-            LOGP("[WIFI] ap=%s sta=%s ssid=\"%s\" ip=%s\n",
-                 AP_SSID,
-                 g_wifi.isConnected() ? "connected" : "down",
-                 g_wifi.currentSsid().c_str(),
-                 g_wifi.localIP().c_str());
-        }
-
-        // 2. Веб-интерфейс (порт 80): вкладки Сеть / Входы-Выходы / Файлы LittleFS
-        web::start();
-        dbgStepMark(8); // веб-сервер поднялся без краха
-
-        LOGP("[NET] network stack up, heap=%u\n", (unsigned)ESP.getFreeHeap());
-        // Инициализация завершена — задача сама завершается (освобождает TCB и
-        // статический стек остаются живы до delete экземпляра — он static).
-    }
+    void run() override { startNetworkStack(); }
 };
+#endif
 
 // ---- Диагностика Watchdog Timer (boot-loop / зависания) ----
 // Прикладные задачи регистрируются в esp_task_wdt (TWDT) с таймаутом
@@ -334,7 +348,9 @@ static HeartbeatTask heartbeatTask;
 static AppLogicTask appLogicTask;  // входы(g_diState) -> логика -> выходы(g_doState)
 static FsLogTask fsLogTask;
 static Rs485Task rs485Task;
-static NetBootTask netBootTask;    // Wi-Fi + веб-сервер (увеличенный стек 8 КБ)
+#if NET_BOOT_USE_TASK
+static NetBootTask netBootTask;    // опция: Wi-Fi + веб-сервер в задаче (стек 8 КБ)
+#endif
 static WdtMonitorTask wdtMonTask;  // диагностика зависаний по имени задачи
 
 // Причина последней перезагрузки (0.6.3): при boot loop без этой строки
@@ -409,9 +425,11 @@ static const char *dbgStepName(int s) {
         case 4:  return "uart bridge";
         case 5:  return "littlefs mount";
         case 6:  return "tasks started";
-        case 7:  return "netboot: wifi begin OK";
-        case 8:  return "netboot: web up OK";
-        case 9:  return "netboot: START (wifi begin не завершён)";
+        case 7:  return "wifi begin OK";
+        case 8:  return "web up OK";
+        case 9:  return "netboot task START (legacy 0.6.5)";
+        case 10: return "Wi-Fi RADIO START (крах внутри WiFi.mode/softAP!)";
+        case 11: return "softAP done (legacy)";
         default: return "?";
     }
 }
@@ -544,13 +562,20 @@ void setup() {
     }
     dbgStepMark(5);
 
-    // 2a/2b. Wi-Fi и веб-сервер — НЕ в setup(): инициализация сетевого стека
-    //     (WiFi AP+STA, lwIP, ESPAsyncWebServer) перенесена в отдельную
-    //     FreeRTOS-задачу "netboot" со стеком 8 КБ (boot-loop fix 0.6.2).
-    //     В контексте loopTask/setup() её стек не вмещался — переполнение
-    //     памяти вызывало boot loop. Задача сама завершается после старта сети.
+    // 2a/2b. Wi-Fi и веб-сервер (0.6.6): старт СИНХРОННО в setup(), до
+    //      прикладных задач. В 0.6.2..0.6.5 для этого поднималась задача
+    //      "netboot" со статическим стеком 8 КБ и приоритетом выше wifi task;
+    //      boot loop при этом остался, а диагностика «last step=7» оказалась
+    //      ложной (маркер писался только ПОСЛЕ успешного begin()). now:
+    //      маркер 10 пишется ПЕРЕД включением радио — при краху внутри
+    //      WiFi.mode()/softAP() в логе будет ровно last step=10.
+    //      Опция возврата к задачному пути: -DNET_BOOT_USE_TASK=1.
+#if NET_BOOT_USE_TASK
     netBootTask.start(os::TaskBase::Config{
         "netboot", NET_BOOT_TASK_STACK_BYTES, NET_BOOT_TASK_PRIORITY, tskNO_AFFINITY});
+#else
+    startNetworkStack();
+#endif
 
     // 3. Прикладные FreeRTOS-задачи
     heartbeatTask.start(os::TaskBase::Config{"hb", 3072, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
