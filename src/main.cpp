@@ -221,7 +221,17 @@ static void startNetworkStack() {
     //    Подключение к домашней сети — исключительно по желанию через
     //    веб-UI (POST /api/network -> handleLoopTick в контексте loopTask).
     dbgStepMark(10); // точка невозврата: СЕЙЧАС поднимаем радио (AP ON)
-    g_wifi.startAccessPoint(AP_SSID, AP_PASSWORD);
+    // 0.6.10: ПОЛНЫЙ A/B-эквивалент эталонной прошивки пользователя (в которой
+    // «WiFi AP работает прекрасно»). Эталон делает ровно:
+    //   WiFi.persistent(false); WiFi.mode(WIFI_AP); WiFi.softAP(ssid, pass);
+    // — синхронно в setup(), БЕЗ setSleep(false), БЕЗ delay() после softAP,
+    // БЕЗ отдельных задач. Любое отклонение здесь подозревается как причина
+    // тихого boot loop (крах между [NET] start и маркером wifi begin OK).
+    // Поэтому радио поднимается минимальным набором вызовов прямо отсюда;
+    // WifiManager::startAccessPoint() остаётся для пути веб-UI.
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
     dbgStepMark(7); // Wi-Fi AP стартовал без краха
     LOGP("[WIFI] ap=%s ip=%s (mode=WIFI_AP, STA off)",
          AP_SSID, g_wifi.localIP().c_str());
@@ -596,12 +606,14 @@ void setup() {
     netBootTask.start(os::TaskBase::Config{
         "netboot", NET_BOOT_TASK_STACK_BYTES, NET_BOOT_TASK_PRIORITY, tskNO_AFFINITY});
 #else
-    // 0.6.8: старт сети выполняется в выделенной задаче на ядре 1 с
-    // приоритетом выше loopTask (см. netSetupTask). Это контекст, из которого
-    // штатно поднимают Wi-Fi в arduino-esp32; при этом loopTask продолжает
-    // крутиться и отвечает на семафоры WiFi.setCore()/mode().
-    xTaskCreatePinnedToCore(netSetupTask, "netsetup", 8192, nullptr,
-                            tskIDLE_PRIORITY + 2, nullptr, 1);
+    // 0.6.10: СИНХРОННЫЙ вызов прямо из setup() — ровно как в эталонной
+    // прошивке пользователя, где AP работает без единого сбоя. Выделенная
+    // задача netsetup на core 1 (0.6.8/0.6.9) убрана: она стартовала сразу
+    // после создания, ещё ДО запуска прикладных задач в конце setup(), и
+    // конкурировала с ними за NVS/CPU именно в тот момент, когда поднималось
+    // радио — это единственный содержательный difference с эталоном, оставшийся
+    // в startup-пути. Опция возврата: -DNET_BOOT_USE_TASK=1.
+    startNetworkStack();
 #endif
 #if RS485_INIT_AFTER_WIFI
     // 1e. Канал RS485: UART1 + RE/DE (конфигурация — rs485_config.h).

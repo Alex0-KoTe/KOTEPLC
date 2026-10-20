@@ -12,7 +12,7 @@
 #define DEFAULT_WIFI_PASSWORD ""
 
 // Версия прошивки
-#define FW_VERSION "0.6.9"
+#define FW_VERSION "0.6.10"
 
 // ---- Boot-loop fix 0.6.7: RS485 ИНИЦИАЛИЗИРУЕТСЯ ПОСЛЕ Wi-Fi ----
 // Диагноз по логам пользователя (0.6.4/0.6.5/0.6.6): крах ВСЕГДА происходит
