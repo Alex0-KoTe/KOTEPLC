@@ -1,0 +1,2 @@
+CompileFlags:
+  Add: [-Isrc/config, -Ilib/hal/include, -Ilib/drivers/include, -Ilib/fs/include, -Ilib/wifi/include, -Ilib/config_service/include, -Ilib/freertos_task/include]
