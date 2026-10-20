@@ -22,6 +22,7 @@
 #include "freertos/semphr.h"
 #include "esp_task_wdt.h"
 #include "esp_err.h"
+#include "esp_netif.h"   // 0.6.11: esp_netif_is_netif_up (прайминг tcpip_thread)
 #include "project_config.h"
 #include "hal/hal_gpio.h"
 #include "hal/hal_mcp23017.h"
@@ -238,8 +239,42 @@ static void startNetworkStack() {
     LOGP(" by design; connect via web UI)\n");
 
     // 2. Веб-интерфейс (порт 80): вкладки Сеть / Входы-Выходы / Файлы LittleFS
-    web::start();
-    dbgStepMark(8); // веб-сервер поднялся без краха
+    // 0.6.11: сервер стартует ПОСЛЕ запуска прикладных задач (см. setup()):
+    // поднят ли сервер — сообщает флаг s_webStarted (web::isStarted()).
+    dbgStepMark(8); // очередь на старт веб-сервера
+
+    // 3. TCP/IP «прогрев» (0.6.11) — КЛЮЧЕВОЕ исправление lwIP boot loop.
+    // Диагноз по backtrace 0.6.10: крах НЕ в Wi-Fi и НЕ в AsyncTCP, а внутри
+    // esp_netif_set_ip4_info() при ПЕРВОМ в мире обращении к ядру TCP/IP:
+    //   tcp_alloc -> "Required to lock TCPIP core functionality!"
+    // (tcpip_lock_tcp_core проверяет owner == xTaskGetCurrentTaskHandle();
+    //  assert срабатывает, когда tcpip_thread ещё не зарегистрировал владельца
+    //  блокировки). Причина: CONFIG_LWIP_TCPIP_TASK_AFFINITY=NO_AFFINITY —
+    //  задача tcpip_thread создаётся ЛЕНИВО, при первом же tcpip_callback.
+    //  На данном SDK она так и не успевала стартовать до вызова softAP(),
+    //  поэтому owner мьютекса оставался NULL и первый же сетевой вызов из
+    //  setup() ронял систему (тихо, без panic-дампа — abort->SW_CPU_RESET).
+    //  Рабочая эталонная прошивка косвенно «тронула» стек TCP/IP раньше
+    //  (например DHCPD при softAP) — поэтому её AP работает идеально.
+    // Исправление: принудительно разбудить tcpip_thread ДО любых операций с
+    // IP-конфигурацией. esp_netif_is_netif_up() вызывает netif->status_get,
+    // который идёт через tcpip_callback -> гарантированно создаёт/крутит
+    // tcpip_thread на его собственном стеке; блокировка корректно
+    // регистрируется владельцем. Вызов идемпотентен и безопасен.
+    {
+        esp_netif_t *apIf = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (apIf) {
+            bool apUp = false;
+            for (int i = 0; i < 5 && !apUp; ++i) {
+                apUp = esp_netif_is_netif_up(apIf); // tcpip_callback => wake tcpip_thread
+                if (!apUp) vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            LOGP("[NET] tcpip core primed (ap netif up=%d)\n", (int)apUp);
+        } else {
+            LOGP("[NET] WARN: AP netif handle not found (default config?)\n");
+        }
+    }
+    dbgStepMark(9); // tcpip_thread разбужен, IP-операции безопасны
 
     LOGP("[NET] network stack up, heap=%u\n", (unsigned)ESP.getFreeHeap());
 }
@@ -476,8 +511,8 @@ static const char *dbgStepName(int s) {
         case 5:  return "littlefs mount";
         case 6:  return "tasks started";
         case 7:  return "wifi begin OK";
-        case 8:  return "web up OK";
-        case 9:  return "netboot task START (legacy 0.6.5)";
+        case 8:  return "queued for web start (0.6.11; legacy: web up OK)";
+        case 9:  return "tcpip core primed (0.6.11; legacy: netboot START)";
         case 10: return "Wi-Fi RADIO START (крах внутри WiFi.mode/softAP!)";
         case 11: return "softAP done (legacy)";
         default: return "?";
@@ -639,6 +674,14 @@ void setup() {
 
     dbgStepMark(6);
     LOGP("[MAIN] tasks started\n");
+
+    // 4b. Веб-сервер (0.6.11): старт ПОСЛЕ прикладных задач и дампа ядер.
+    // В 0.6.10 s_server.begin() вызывался из setup() сразу после softAP —
+    // в момент, когда tcpip_thread ещё не успевал зарегистрироваться владельцем
+    // блокировки ядра TCP/IP (см. startNetworkStack). Теперь радио-стек
+    // «прогрет» (netif поднят, tcpip_thread живёт), loopTask уже работает —
+    // listen-портоваться безопасно. Функция идемпотентна (s_started).
+    web::start();
 
     // 5. 0.6.8: диагностика раскладки по ядрам — штатно loopTask/AsyncTCP/
     //    lwIP живут на core 1, esp_wifi на core 0; прикладные задачи закреплены

@@ -116,17 +116,11 @@ static void handleNetworkPost(AsyncWebServerRequest *req) {
     replyJson(req, 200, "{\"ok\":true}");
 }
 
-// Задача применения сетевых настроек: сохранение в NVS + переподключение STA.
-// FW 0.6.8: сама задача НЕ трогает Wi-Fi-стек (это и был источник краха
-// tcp_alloc — WiFi.begin()/mode() из сторонней задачи на другом ядре).
-// netApplyTask лишь ждёт флага s_netPending; реальное применение выполняет
-// web::handleLoopTick() в контексте loopTask (см. src/main.cpp, loop()).
-static void netApplyTask(void *) {
-    for (;;) {
-        // Ожидаем запрос; применение — целиком на стороне loopTask.
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-}
+// Задача применения сетевых настроек (netApplyTask) удалена в 0.6.11: она не
+// трогала Wi-Fi-стек (FW 0.6.8 перенёс всю логику в web::handleLoopTick(),
+// контекст loopTask), но бесконечная задача-пустышка с vTaskDelay(500) при
+// приоритете tskIDLE_PRIORITY+2 отнимала квант планировщика у loopTask и
+// попадала в дампы uxTaskGetSystemState, запутывая диагностику boot loop.
 
 // ---------------- файлы LittleFS (/www) ----------------
 static void handleFsList(AsyncWebServerRequest *req) {
@@ -256,7 +250,7 @@ void start() {
                 handleUpload);
     s_server.begin();
     s_started = true;
-    xTaskCreate(netApplyTask, "netapply", 6144, nullptr, tskIDLE_PRIORITY + 2, nullptr);
+    // 0.6.11: netApplyTask (пустышка, см. выше) больше не создаётся.
     LOGP("[WEB] server started on :80\n");
 }
 
