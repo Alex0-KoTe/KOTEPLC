@@ -37,6 +37,14 @@
 #include "config_service.h"
 #include "web_server.h"
 
+// FW 0.6.12 (boot-loop fix): флаг готовности ядра TCP/IP. Выставляется по
+// событию ARDUINO_EVENT_WIFI_AP_START (штатное событие режима стартапа этой
+// платы — чистый WIFI_AP) либо fallback'ом по факту поднятого AP netif.
+// Раньше готовность определялась событием STA_START, которое в AP-only
+// стартапе не приходит никогда — ожидание уходило в таймаут, трактовался
+// как фатальный и заканчивался перезагрузкой (SW_CPU_RESET).
+static volatile bool s_tcpipReady = false;
+
 // Прототипы вспомогательных функций уровня приложения (определения ниже)
 
 // Heartbeat для диагностики зависаний через Watchdog Timer (0.6.2):
@@ -261,10 +269,12 @@ static void startNetworkStack() {
     // который идёт через tcpip_callback -> гарантированно создаёт/крутит
     // tcpip_thread на его собственном стеке; блокировка корректно
     // регистрируется владельцем. Вызов идемпотентен и безопасен.
+    // 0.6.12: результат прогрева (apUp) — fallback-доказательство готовности
+    // ядра для флага s_tcpipReady (см. шаг 4 ниже).
     {
         esp_netif_t *apIf = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        bool apUp = false;
         if (apIf) {
-            bool apUp = false;
             for (int i = 0; i < 5 && !apUp; ++i) {
                 apUp = esp_netif_is_netif_up(apIf); // tcpip_callback => wake tcpip_thread
                 if (!apUp) vTaskDelay(pdMS_TO_TICKS(50));
@@ -273,8 +283,38 @@ static void startNetworkStack() {
         } else {
             LOGP("[NET] WARN: AP netif handle not found (default config?)\n");
         }
+        if (apUp) s_tcpipReady = true; // fallback: AP поднят => ядро живо
     }
     dbgStepMark(9); // tcpip_thread разбужен, IP-операции безопасны
+
+    // 4. FW 0.6.12 (boot-loop fix): флаг готовности TCP/IP-ядра выставляется
+    //    по событию ARDUINO_EVENT_WIFI_AP_START вместо STA_START.
+    //    Причина: стартап этой платы — чистый WIFI_AP (STA включается лениво,
+    //    только из веб-UI), поэтому событие STA_START здесь не приходит
+    //    НИКОГДА; любое ожидание «STA-события => ядро готово» в AP-only
+    //    режиме неизбежно уходит в таймаут и заканчивается перезагрузкой
+    //    (SW_CPU_RESET сразу после «[NET] network stack up»). AP_START —
+    //    штатное событие нашего режима (см. лог: mode=WIFI_AP), оно и
+    //    устанавливает s_tcpipReady. Обработчик регистрируется идемпотентно
+    //    (флаг s_apEvtRegistered); если событие уже обработано ESP-аркой
+    //    до регистрации, считается доказательством сам факт поднятого AP
+    //    netif (apUp выше) — событийная очередь Arduino не хранит историю.
+    static bool s_apEvtRegistered = false;
+    if (!s_apEvtRegistered) {
+        WiFi.onEvent([](arduino_event_id_t ev) {
+            if (ev == ARDUINO_EVENT_WIFI_AP_START) s_tcpipReady = true;
+        });
+        s_apEvtRegistered = true;
+    }
+    // Дождаться диспатча AP_START из контекста loopTask (WiFi.run() гоняет
+    // очередь событий esp_wifi -> Arduino). Таймаут НЕ фатален: прайминг
+    // tcpip_thread (шаг 3) уже выполнен, сеть работоспособна.
+    for (int i = 0; i < 20 && !s_tcpipReady; ++i) {
+        WiFi.run(); // диспатч ARDUINO_EVENT_WIFI_AP_START -> s_tcpipReady
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+    LOGP("[NET] tcpip ready flag=%d (set by %s)\n", (int)s_tcpipReady,
+         s_tcpipReady ? "AP_START" : "timeout, netif-up fallback holds");
 
     LOGP("[NET] network stack up, heap=%u\n", (unsigned)ESP.getFreeHeap());
 }
@@ -697,6 +737,11 @@ void loop() {
     // контекста loopTask (ядро Arduino): сторонние задачи, дёргающие
     // WiFi.begin()/mode(), ломали блокировки ядра TCP/IP — крах
     // "assert failed: tcp_alloc ... Required to lock TCPIP core".
+    // FW 0.6.12: диспатч WiFi-событий из контекста loopTask — событие
+    // ARDUINO_EVENT_WIFI_AP_START (и все последующие STA/AP-события)
+    // устанавливает s_tcpipReady; без этого вызова очередь событий
+    // esp_wifi осталась бы непрочищенной после стартапа.
+    WiFi.run();
     web::handleLoopTick();
     vTaskDelay(pdMS_TO_TICKS(10));
 }

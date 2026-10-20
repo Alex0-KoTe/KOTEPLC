@@ -8,9 +8,9 @@
 // контекст Arduino). Это обязательное требование esp_wifi/lwIP-стека Arduino:
 // вызовы из других задач гоняют wifi/lwIP-мьютексы между ядрами и приводят к
 // краху "assert failed: tcp_alloc ... Required to lock TCPIP core functionality".
-// Обработчик POST /api/network теперь лишь публикует запрос; применяет его
-// netApplyTask через tickLoop() (см. ниже), который передаёт управление
-// loopTask'у и ждёт флага s_netDone от handleLoopTick().
+// Обработчик POST /api/network теперь лишь публикует запрос (s_netPending);
+// применяет его web::handleLoopTick(), вызываемый из loop() в main.cpp, —
+// все действия с Wi-Fi-стеком идут строго из контекста loopTask.
 #include "web_server.h"
 
 #include <Arduino.h>
