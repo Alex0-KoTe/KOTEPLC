@@ -1,7 +1,8 @@
 // Веб-интерфейс KOTELPC: REST API + одностраничный UI (тёмная тема).
 // Сервер — ESPAsyncWebServer (порт 80), работает на стеке AsyncTCP,
 // поэтому блокирующих операций в обработчиках нет; тяжёлые действия
-// (сохранение настроек Wi-Fi) откладываются в отдельную FreeRTOS-задачу.
+// (сохранение настроек Wi-Fi) публикуются как флаг s_netPending и
+// выполняются web::handleLoopTick() из loopTask (см. ниже).
 //
 // FW 0.6.8 (крах tcp_alloc / lwIP): все сетевые операции — WiFi.mode/softAP,
 // TCP listen/connect и т.п. — выполняются ТОЛЬКО из задачи loopTask (ядро 1,
@@ -38,7 +39,8 @@ static bool s_started = false;
 // ---------- запрос на применение сетевых настроек (из POST /api/network) ----------
 struct NetRequest { char ssid[65]; char pass[65]; };
 static volatile bool s_netPending = false;
-static volatile bool s_netDone = false;   // loopTask подтверждает выполнение
+static volatile bool s_netDone = false;   // зарезервировано: loopTask подтверждает
+                                          // выполнение (нигде не читается)
 static NetRequest s_netReq;
 static SemaphoreHandle_t s_netMutex = nullptr;
 
@@ -209,8 +211,9 @@ bool isRunning() { return s_started; }
 
 // FW 0.6.8: применение сетевых настроек в контексте loopTask (см. main.cpp).
 // Вызывается из loop(); выполняет NVS-сохранение и переподключение STA здесь,
-// а НЕ в netApplyTask — все WiFi.begin()/mode()/softAP обязаны идти из одной
-// задачи (loopTask, ядро Arduino), иначе lwIP/esp_wifi падают по assert.
+// а НЕ в отдельной задаче (netApplyTask удалена в 0.6.11) — все
+// WiFi.begin()/mode()/softAP обязаны идти из одной задачи (loopTask, ядро
+// Arduino), иначе lwIP/esp_wifi падают по assert.
 void handleLoopTick() {
     if (!s_netPending) return;
     NetRequest rq;
