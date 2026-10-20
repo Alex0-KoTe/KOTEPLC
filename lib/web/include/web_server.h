@@ -21,6 +21,11 @@ void start();                        // поднять сервер (вызыв�
 bool isRunning();                    // сервер запущен
 void setDiDo(uint8_t di, uint8_t do_, bool mcpReady);  // снимок состояний из AppLogicTask
 
+// FW 0.6.8: вызывать из loop() (контекст loopTask). Применяет запрос
+// переподключения Wi-Fi из веб-UI в правильном контексте задачи Arduino —
+// сетевые вызовы из других задач приводили к краху lwIP (tcp_alloc assert).
+void handleLoopTick();
+
 } // namespace web
 
 #endif // WEB_SERVER_H

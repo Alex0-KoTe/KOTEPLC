@@ -40,6 +40,11 @@ void WifiManager::startAccessPoint(const String &ssid, const String &password) {
     // сверху, когда задана сеть.
     WiFi.persistent(false);
     WiFi.mode(WIFI_AP_STA);
+    // 0.6.8: в arduino-esp32 3.x раскладка ядер задаётся на этапе сборки
+    // (CONFIG_ARDUINO_RUNNING_CORE=1, CONFIG_ESP_WIFI_TASK_CORE_ID=0) —
+    // рантайм-API setCore()/radio_task_on_cpu() здесь недоступен. Штатная
+    // раскладка уже корректна: loopTask/AsyncTCP/lwIP на core 1, задача
+    // esp_wifi на core 0. Никаких WiFi-вызовов из прикладных задач!
     WiFi.setSleep(false);
     WiFi.softAP(ssid.c_str(), password.c_str());
     delay(120);   // дать драйверу поднять AP перед возможными STA-операциями

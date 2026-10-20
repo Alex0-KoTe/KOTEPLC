@@ -357,6 +357,16 @@ static NetBootTask netBootTask;    // опция: Wi-Fi + веб-сервер в
 #endif
 static WdtMonitorTask wdtMonTask;  // диагностика зависаний по имени задачи
 
+// 0.6.8: задача-обёртка для синхронного старта сети (см. startNetworkStack).
+// Запускается из setup() на ядре 1, с приоритетом ВЫШЕ loopTask — иначе
+// lowPriorityLoop (приоритет 1) блокирует loopTask до конца setup(), и
+// xSemaphoreTake(loopDoneSem) внутри WiFi.setCore()/mode() не разблокируется
+// никогда (ложная "зависимость" на шаге радио). Стек — динамический, 8 КБ.
+static void netSetupTask(void *) {
+    startNetworkStack();
+    vTaskDelete(nullptr);
+}
+
 // ---- Канал RS485: UART1 + RE/DE (конфигурация — rs485_config.h) ----------
 // FW 0.6.7: вынесено из середины setup() в отдельную функцию и вызывается
 // ПОСЛЕ старта Wi-Fi/веб-сервера (RS485_INIT_AFTER_WIFI=1). Диагноз boot loop
@@ -480,6 +490,20 @@ static void logBootResetReason() {
     LOGP("[BOOT] last step=%d (%s)\n", dbgStepRead(), dbgStepName(dbgStepRead()));
 }
 
+// 0.6.8: диагностика раскладки задач по ядрам (штатная раскладка
+// arduino-esp32 3.x задаётся на этапе сборки: loopTask/AsyncTCP/lwIP — core 1,
+// esp_wifi — core 0; рантайм-API смены аффинности в этом SDK недоступен).
+// Дамп uxTaskGetSystemState показывает фактическое ядро каждой задачи — по
+// нему видно, что сетевой контекст не смешан с прикладным на одном ядре.
+static void dumpTaskCoreAffinity() {
+    static TaskStatus_t st[24];
+    UBaseType_t n = uxTaskGetSystemState(st, 24, nullptr);
+    for (UBaseType_t i = 0; i < n; ++i) {
+        LOGP("[CORE] task \"%s\": core=%d, prio=%u\n",
+             st[i].pcTaskName, (int)st[i].xCoreID, (unsigned)st[i].uxCurrentPriority);
+    }
+}
+
 void setup() {
     const uint32_t bootMs = millis(); // бюджет времени инициализации MCP (non-blocking)
     // Отладочный Serial (до инициализации моста логи идут сюда же)
@@ -577,7 +601,12 @@ void setup() {
     netBootTask.start(os::TaskBase::Config{
         "netboot", NET_BOOT_TASK_STACK_BYTES, NET_BOOT_TASK_PRIORITY, tskNO_AFFINITY});
 #else
-    startNetworkStack();
+    // 0.6.8: старт сети выполняется в выделенной задаче на ядре 1 с
+    // приоритетом выше loopTask (см. netSetupTask). Это контекст, из которого
+    // штатно поднимают Wi-Fi в arduino-esp32; при этом loopTask продолжает
+    // крутиться и отвечает на семафоры WiFi.setCore()/mode().
+    xTaskCreatePinnedToCore(netSetupTask, "netsetup", 8192, nullptr,
+                            tskIDLE_PRIORITY + 2, nullptr, 1);
 #endif
 #if RS485_INIT_AFTER_WIFI
     // 1e. Канал RS485: UART1 + RE/DE (конфигурация — rs485_config.h).
@@ -592,21 +621,32 @@ void setup() {
 #endif
 
     // 3. Прикладные FreeRTOS-задачи
-    heartbeatTask.start(os::TaskBase::Config{"hb", 3072, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
-    appLogicTask.start(os::TaskBase::Config{"app", 3072, tskIDLE_PRIORITY + 2, tskNO_AFFINITY});
-    fsLogTask.start(os::TaskBase::Config{"fslog", 4096, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
-    rs485Task.start(os::TaskBase::Config{"rs485", 4096, tskIDLE_PRIORITY + 2, tskNO_AFFINITY});
+    heartbeatTask.start(os::TaskBase::Config{"hb", 3072, tskIDLE_PRIORITY + 1, 0});
+    appLogicTask.start(os::TaskBase::Config{"app", 3072, tskIDLE_PRIORITY + 2, 0});
+    fsLogTask.start(os::TaskBase::Config{"fslog", 4096, tskIDLE_PRIORITY + 1, 0});
+    rs485Task.start(os::TaskBase::Config{"rs485", 4096, tskIDLE_PRIORITY + 2, 0});
 
     // 4. Монитор Watchdog Timer: подписывает задачи на esp_task_wdt и при
     //    просрочке heartbeat позволяет ядру напечатать имя зависшей задачи.
-    wdtMonTask.start(os::TaskBase::Config{"wdtmon", 3072, tskIDLE_PRIORITY + 1, tskNO_AFFINITY});
+    wdtMonTask.start(os::TaskBase::Config{"wdtmon", 3072, tskIDLE_PRIORITY + 1, 0});
 
     dbgStepMark(6);
     LOGP("[MAIN] tasks started\n");
+
+    // 5. 0.6.8: диагностика раскладки по ядрам — штатно loopTask/AsyncTCP/
+    //    lwIP живут на core 1, esp_wifi на core 0; прикладные задачи закреплены
+    //    за core 0 (см. выше). Дамп [CORE] позволяет это проверить в логе.
+    dumpTaskCoreAffinity();
 }
 
 void loop() {
     // В Arduino-каркасе loop() сам по себе является задачей FreeRTOS.
     // Вся полезная работа вынесена в задачи выше.
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    // FW 0.6.8: здесь же обрабатываются СЕТЕВЫЕ запросы из веб-UI
+    // (переподключение Wi-Fi). Все вызовы esp_wifi/lwIP обязаны идти из
+    // контекста loopTask (ядро Arduino): сторонние задачи, дёргающие
+    // WiFi.begin()/mode(), ломали блокировки ядра TCP/IP — крах
+    // "assert failed: tcp_alloc ... Required to lock TCPIP core".
+    web::handleLoopTick();
+    vTaskDelay(pdMS_TO_TICKS(10));
 }

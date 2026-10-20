@@ -2,6 +2,15 @@
 // Сервер — ESPAsyncWebServer (порт 80), работает на стеке AsyncTCP,
 // поэтому блокирующих операций в обработчиках нет; тяжёлые действия
 // (сохранение настроек Wi-Fi) откладываются в отдельную FreeRTOS-задачу.
+//
+// FW 0.6.8 (крах tcp_alloc / lwIP): все сетевые операции — WiFi.mode/softAP,
+// TCP listen/connect и т.п. — выполняются ТОЛЬКО из задачи loopTask (ядро 1,
+// контекст Arduino). Это обязательное требование esp_wifi/lwIP-стека Arduino:
+// вызовы из других задач гоняют wifi/lwIP-мьютексы между ядрами и приводят к
+// краху "assert failed: tcp_alloc ... Required to lock TCPIP core functionality".
+// Обработчик POST /api/network теперь лишь публикует запрос; применяет его
+// netApplyTask через tickLoop() (см. ниже), который передаёт управление
+// loopTask'у и ждёт флага s_netDone от handleLoopTick().
 #include "web_server.h"
 
 #include <Arduino.h>
@@ -29,6 +38,7 @@ static bool s_started = false;
 // ---------- запрос на применение сетевых настроек (из POST /api/network) ----------
 struct NetRequest { char ssid[65]; char pass[65]; };
 static volatile bool s_netPending = false;
+static volatile bool s_netDone = false;   // loopTask подтверждает выполнение
 static NetRequest s_netReq;
 static SemaphoreHandle_t s_netMutex = nullptr;
 
@@ -107,27 +117,13 @@ static void handleNetworkPost(AsyncWebServerRequest *req) {
 }
 
 // Задача применения сетевых настроек: сохранение в NVS + переподключение STA.
+// FW 0.6.8: сама задача НЕ трогает Wi-Fi-стек (это и был источник краха
+// tcp_alloc — WiFi.begin()/mode() из сторонней задачи на другом ядре).
+// netApplyTask лишь ждёт флага s_netPending; реальное применение выполняет
+// web::handleLoopTick() в контексте loopTask (см. src/main.cpp, loop()).
 static void netApplyTask(void *) {
     for (;;) {
-        if (s_netPending) {
-            NetRequest rq;
-            xSemaphoreTake(s_netMutex, portMAX_DELAY);
-            rq = s_netReq;
-            s_netPending = false;
-            xSemaphoreGive(s_netMutex);
-
-            LOGP("[WEB] applying network: ssid=\"%s\"\n", rq.ssid);
-            ConfigService svc;
-            DeviceConfig cfg;
-            svc.load(cfg);
-            cfg.wifiSsid = rq.ssid;
-            cfg.wifiPassword = rq.pass;
-            svc.save(cfg);
-            g_wifi.begin(rq.ssid, rq.pass);      // AP поднят всегда; сверху — STA
-            LOGP("[WEB] wifi now: sta=%s ip=%s\n",
-                 g_wifi.isConnected() ? "connected" : "down",
-                 g_wifi.localIP().c_str());
-        }
+        // Ожидаем запрос; применение — целиком на стороне loopTask.
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
@@ -216,6 +212,32 @@ void setDiDo(uint8_t di, uint8_t do_, bool mcpReady) {
 }
 
 bool isRunning() { return s_started; }
+
+// FW 0.6.8: применение сетевых настроек в контексте loopTask (см. main.cpp).
+// Вызывается из loop(); выполняет NVS-сохранение и переподключение STA здесь,
+// а НЕ в netApplyTask — все WiFi.begin()/mode()/softAP обязаны идти из одной
+// задачи (loopTask, ядро Arduino), иначе lwIP/esp_wifi падают по assert.
+void handleLoopTick() {
+    if (!s_netPending) return;
+    NetRequest rq;
+    xSemaphoreTake(s_netMutex, portMAX_DELAY);
+    rq = s_netReq;
+    s_netPending = false;
+    xSemaphoreGive(s_netMutex);
+
+    LOGP("[WEB] applying network (loopTask ctx): ssid=\"%s\"\n", rq.ssid);
+    ConfigService svc;
+    DeviceConfig cfg;
+    svc.load(cfg);
+    cfg.wifiSsid = rq.ssid;
+    cfg.wifiPassword = rq.pass;
+    svc.save(cfg);
+    g_wifi.begin(rq.ssid, rq.pass);      // AP поднят всегда; сверху — STA
+    LOGP("[WEB] wifi now: sta=%s ip=%s\n",
+         g_wifi.isConnected() ? "connected" : "down",
+         g_wifi.localIP().c_str());
+    s_netDone = true;
+}
 
 void start() {
     if (s_started) return;
