@@ -23,6 +23,8 @@
 #include "esp_task_wdt.h"
 #include "hal/wdt_hal.h"   // FW 0.6.14: wdt_hal_disable (INT_WDT/RWDT)
 #include "esp_err.h"
+#include "esp_system.h"      // FW 0.6.17: esp_reset_reason (кольцевой выбор шага)
+#include "esp_rom_sys.h"     // FW 0.6.17: esp_rom_get_reset_reason — ранняя метка boot-счётчика
 #include "esp_netif.h"   // 0.6.11: esp_netif_is_netif_up (прайминг tcpip_thread)
 #include "project_config.h"
 #include "hal/hal_gpio.h"
@@ -584,26 +586,91 @@ static bool dbgNvsInit() {
     return err == ESP_OK;
 }
 
+// FW 0.6.17: маркер пишется в ДВЕ независимые ячейки — "step" (u8) и
+// "step2" (i32). Причина: логи 0.6.14..0.6.16 показывали противоречие —
+// «last step» при каждом boot равнялся шагу ПОСЛЕДНЕЙ записи прошлого запуска
+// (6), хотя по ходу setup() записывались 10/7/8/9/12/15. Если бы reset был
+// асинхронным (brownout/WDT), commit последней записи не доживал бы до
+// сброса. Когда обе независимые ячейки переживают сброс с одинаковым новым
+// значением — запись точно завершилась ДО сброса, т.е. сброс синхронный
+// (ESP.restart()/abort) и исходит из кода после последней NVS-записи.
+// Чтение на boot: каждая запись сопровождается ВРЕМЕННОЙ МЕТКОЙ (t1/t2) —
+// esp_timer_get_time() монотонен от boot до boot (RTC timer не сбрасывается
+// при SW/WDT-сбросе), поэтому порядок любых двух записей восстанавливается
+// однозначно, даже если ячейки разошлись из-за переполнения счётчика
+// перезагрузок между ними. Кольцевая шкала 0..255 — только fallback, когда
+// метка не читается.
 static void dbgStepMark(uint8_t step) {
     static bool nvsReady = dbgNvsInit();
     if (!nvsReady) return;
+    const int64_t nowUs = esp_timer_get_time();
     nvs_handle_t h;
     if (nvs_open("koteldbg", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, "step", step);
+        nvs_set_i32(h, "step2", static_cast<int32_t>(step));
+        nvs_set_i64(h, "t1", nowUs);
+        nvs_set_i64(h, "t2", nowUs);
         nvs_commit(h);
         nvs_close(h);
     }
 }
 
+// Чтение одной пары (значение шага + его временная метка). ok=false, если
+// ячейка отсутствует/испорчена или метка не читается.
+struct StepCell {
+    int val = -1;
+    int64_t ts = -1;
+    bool valid() const { return val >= 0 && ts >= 0; }
+};
+
+static StepCell dbgStepReadCell(nvs_handle_t h, const char *keyVal,
+                                bool isI32, const char *keyTs) {
+    StepCell c;
+    int64_t ts = -1;
+    if (isI32) {
+        int32_t i = -1;
+        if (nvs_get_i32(h, keyVal, &i) != ESP_OK || i < 0) return c;
+        c.val = (int)i;
+    } else {
+        uint8_t u = 0xFF;
+        if (nvs_get_u8(h, keyVal, &u) != ESP_OK || u == 0xFF) return c;
+        c.val = (int)u;
+    }
+    if (nvs_get_i64(h, keyTs, &ts) != ESP_OK || ts < 0) { c.val = -1; return c; }
+    c.ts = ts;
+    return c;
+}
+
+// FW 0.6.17: кольцевая разница шагов по шкале 0..255 (fallback-выбор, когда
+// временная метка записи не читается — см. dbgStepRead).
+static int dbgStepRingDist(int a, int b) {
+    int d = a - b;
+    if (d < 0) d = -d;
+    return (d > 128) ? 256 - d : d;
+}
+
 static int dbgStepRead() {
     if (!dbgNvsInit()) return -1;
     nvs_handle_t h;
-    uint8_t v = 0xFF;
+    StepCell c1, c2;
     if (nvs_open("koteldbg", NVS_READONLY, &h) == ESP_OK) {
-        if (nvs_get_u8(h, "step", &v) != ESP_OK) v = 0xFF;
+        c1 = dbgStepReadCell(h, "step", false, "t1");   // u8  + i64 ts
+        c2 = dbgStepReadCell(h, "step2", true, "t2");   // i32 + i64 ts
         nvs_close(h);
     }
-    return (v == 0xFF) ? -1 : (int)v;
+    // Приоритет у step2 (независимая запись). Если обе ячейки живы и
+    // РАЗЛИЧАЮТСЯ — берём ту, чья временная метка НОВОЕ (запись позже по
+    // времени = шаг ближе к моменту сброса). Без метки — fallback на
+    // кольцевую шкалу относительно текущей причины reset.
+    if (c1.valid() && c2.valid() && c1.val != c2.val) {
+        if (c2.ts > c1.ts) return c2.val;
+        if (c1.ts > c2.ts) return c1.val;
+        const int cur = (int)(esp_rom_get_reset_reason(0) & 0xFF);
+        return dbgStepRingDist(c2.val, cur) <= dbgStepRingDist(c1.val, cur) ? c2.val : c1.val;
+    }
+    if (c2.valid()) return c2.val;
+    if (c1.valid()) return c1.val;
+    return c2.val >= 0 ? c2.val : c1.val; // шаг есть, метки нет — step2 в приоритете
 }
 
 static const char *dbgStepName(int s) {
@@ -709,8 +776,17 @@ static void disableHardwareWatchdogs() {
     wdt_hal_write_protect_disable(&rwdt);
     wdt_hal_disable(&rwdt);
     wdt_hal_write_protect_enable(&rwdt);
-    LOGP("[BOOT] hardware watchdogs disabled: TWDT deinit=%d, RWDT enabled=%d\n",
-         (int)eTw, (int)wdt_hal_is_enabled(&rwdt));
+    // 3) FW 0.6.17: Brownout Detector — НЕ гасим! Сбросы идут ПОСЛЕ успешной
+    //    записи маркеров в NVS (flash-операция завершена, питание в норме) —
+    //    значит это программный синхронный ESP.restart(), а не просадка.
+    //    bootloader_get_brownout_en() отсутствует в public-заголовках этого
+    //    SDK (ломал сборку 0.6.17) — читаем состояние BOD напрямую из RTC
+    //    регистра (адрес/бит из esp32 rom: RTC_CNTL_BROWNOUT_REG @0x3FF48018,
+    //    RTC_CNTL_BROWNOUT_EN_M = bit5).
+    const uint32_t bodReg = READ_PERI_REG(0x3FF48018);
+    const int bodEn = (bodReg >> 5) & 1u;
+    LOGP("[BOOT] hardware watchdogs disabled: TWDT deinit=%d, RWDT enabled=%d, BOD=%d (reg=0x%08X)\n",
+         (int)eTw, (int)wdt_hal_is_enabled(&rwdt), bodEn, (unsigned)bodReg);
 }
 
 void setup() {
@@ -825,6 +901,39 @@ void setup() {
     // радио — это единственный содержательный difference с эталоном, оставшийся
     // в startup-пути. Опция возврата: -DNET_BOOT_USE_TASK=1.
     startNetworkStack();
+#endif
+    // FW 0.6.17 (boot-loop fix v4): СИНХРОНИЗАЦИЯ С ЭТАЛОНОМ — эксперимент.
+    // Рабочая эталонная прошивка пользователя поднимает AP из setup() без
+    // единого сбоя; в ней НЕТ ни PERIPH_EN, ни MCP23017, ни LittleFS/NVS,
+    // ни RS485/задач/web-сервера. Наш boot loop приходит ровно ПОСЛЕ
+    // «network init survived» — т.е. во второй половине setup(). Сборка с
+    // -DBOOT_MINIMAL_EXPERIMENT=1: радио поднято (выше), ВСЁ остальное
+    // вырезано. Проживёт >10 с — виновник гарантированно в отключённых
+    // блоках (бисектим по одному); нет — остаётся питание (brownout при
+    // пике тока радио ~240 мА). Возврат к полному пути: =0.
+#if BOOT_MINIMAL_EXPERIMENT
+    // FW 0.6.17 v2: питание ИСКЛЮЧЕНО пользователем — на этом железе другая
+    // прошивка с Wi-Fi работает без сбоя. Значит сброс — программный и
+    // синхронный (ESP.restart()/abort в нашем коде), а не brownout.
+    // Эксперимент разбит на два шага, чтобы найти виновника за один прогон:
+    //   =1 — только радио (AP): всё остальное вырезано;
+    //   =2 — радио + все прикладные задачи, НО БЕЗ web::start() и финальных
+    //        NVS-записей. Проживёт >30 с — виновник web::start()/AsyncTCP или
+    //        финализация setup(); умрёт — одна из задач (hb/app/fslog/rs485/
+    //        wdtmon) или их взаимодействие с сетевым стеком.
+    LOGP("[BOOT] MINIMAL EXPERIMENT BUILD: skipping RS485/tasks/web/NVS tail of setup().\n");
+    LOGP("[BOOT] If no reset within ~10s -> culprit is in the skipped blocks (bisect next).\n");
+#if BOOT_MINIMAL_EXPERIMENT >= 2
+    heartbeatTask.start(os::TaskBase::Config{"hb", 3072, tskIDLE_PRIORITY + 1, 0});
+    appLogicTask.start(os::TaskBase::Config{"app", 3072, tskIDLE_PRIORITY + 2, 0});
+    fsLogTask.start(os::TaskBase::Config{"fslog", 4096, tskIDLE_PRIORITY + 1, 0});
+    rs485Task.start(os::TaskBase::Config{"rs485", 4096, tskIDLE_PRIORITY + 2, 0});
+    wdtMonTask.start(os::TaskBase::Config{"wdtmon", 3072, tskIDLE_PRIORITY + 1, 0});
+    dbgStepMark(6);
+    LOGP("[BOOT] EXPERIMENT=2: tasks started, NO web::start(), NO NVS finalization.\n");
+    LOGP("[BOOT] Survived >30s -> culprit is web::start()/finalization; reset -> a task.\n");
+#endif
+    return;
 #endif
 #if RS485_INIT_AFTER_WIFI
     // 1e. Канал RS485: UART1 + RE/DE (конфигурация — rs485_config.h).
