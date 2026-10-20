@@ -12,7 +12,7 @@
 #define DEFAULT_WIFI_PASSWORD ""
 
 // Версия прошивки
-#define FW_VERSION "0.6.13"
+#define FW_VERSION "0.6.14"
 
 // ---- Boot-loop bisect 0.6.13: периодический NVS-маркер из loop() ----
 // В логе 0.6.12 сброс (SW_CPU_RESET) приходит сразу после "[NET] network

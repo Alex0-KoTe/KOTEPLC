@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_task_wdt.h"
+#include "hal/wdt_hal.h"   // FW 0.6.14: wdt_hal_disable (INT_WDT/RWDT)
 #include "esp_err.h"
 #include "esp_netif.h"   // 0.6.11: esp_netif_is_netif_up (прайминг tcpip_thread)
 #include "project_config.h"
@@ -55,6 +56,8 @@ inline void wdtKickNow();
 // Маркер шагов инициализации (boot-loop bisect, 0.6.4) — определения ниже,
 // используются и в NetBootTask, и в setup().
 static void dbgStepMark(uint8_t step);
+static bool dbgNvsInit();
+static const char *nvs_anchor_read();
 
 // Инициализация канала RS485 (FW 0.6.7: вынесена из setup() и вызывается
 // ПОСЛЕ старта сети; определение — после объявлений задач ниже).
@@ -336,8 +339,11 @@ static void startNetworkStack() {
     // старте last step=12 — код проходит setup до конца, и виновник живёт
     // в loop()/пост-setup; если last step остаётся 6 — крах внутри окна
     // (диагностика further бисектится опцией NET_LOOP_MARK_EVERY_MS).
+    // FW 0.6.13 (boot-loop bisect): промежуточный «маркер выживания» после
+    // сетевой инициализации. Финальный маркер + снятие аппаратных watchdog'ов
+    // — в конце setup() (см. шаг 6 там же, FW 0.6.14).
     dbgStepMark(12);
-    LOGP("[BOOT] setup complete, survived to loop()\n");
+    LOGP("[BOOT] network init survived, continuing setup()\n");
 }
 
 // Старый netboot-задачный путь (0.6.2..0.6.5) оставлен как опция: сборка с
@@ -591,6 +597,14 @@ static void logBootResetReason() {
     // Если boot loop остаётся — по этому коду сразу видно, на каком шаге
     // происходит крах (см. таблицу шагов у dbgStepMark()).
     LOGP("[BOOT] last step=%d (%s)\n", dbgStepRead(), dbgStepName(dbgStepRead()));
+    // FW 0.6.14: «якорь» предыдущего запуска — если он равен текущей
+    // FW_VERSION, прошлая прошивка доходила до конца setup() (сброс
+    // произошёл ПОСЛЕ него); если NULL/старая версия — крах ВНУТРИ setup().
+    {
+        const char *anchor = nvs_anchor_read();
+        LOGP("[BOOT] prev setup-complete anchor: %s\n",
+             anchor ? anchor : "(none — previous boot never finished setup)");
+    }
 }
 
 // 0.6.8: диагностика раскладки задач по ядрам (штатная раскладка
@@ -605,6 +619,45 @@ static void dumpTaskCoreAffinity() {
         LOGP("[CORE] task \"%s\": core=%d, prio=%u\n",
              st[i].pcTaskName, (int)st[i].xCoreID, (unsigned)st[i].uxCurrentPriority);
     }
+}
+
+// Пишет raw-маркер namespace "koteldbg"/key "ok" = FW_VERSION (без обёртки
+// Preferences). Идемпотентен; читается на следующем boot (logBootResetReason).
+static void nvs_anchor_setup_ok() {
+    if (!dbgNvsInit()) return;
+    nvs_handle_t h;
+    if (nvs_open("koteldbg", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, "ok", FW_VERSION);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+// Считает якорь предыдущего запуска (NULL, если не установлен).
+static const char *nvs_anchor_read() {
+    static char buf[16];
+    if (!dbgNvsInit()) return nullptr;
+    nvs_handle_t h;
+    if (nvs_open("koteldbg", NVS_READONLY, &h) != ESP_OK) return nullptr;
+    size_t sz = sizeof(buf);
+    const esp_err_t err = nvs_get_str(h, "ok", buf, &sz);
+    nvs_close(h);
+    return (err == ESP_OK) ? buf : nullptr;
+}
+
+// Полное отключение аппаратных watchdog'ов: INT_WDT (CONFIG_ESP32_INT_WDT=y
+// в arduino-esp32 3.x — включается на boot, таймаут ~2 с) и RWDT
+// (CONFIG_ESP32_RTIMER_WDT=y) — через wdt_hal_disable. Вызывается один
+// раз в конце setup().
+// esp_task_wdt_delete(NULL) дополнительно снимает текущую задачу (loopTask)
+// с группового MWDT — дальше собаки не кусаются вовсе.
+static void disableHardwareWatchdogs() {
+    const esp_err_t e1 = esp_task_wdt_delete(NULL); // снять loopTask с MWDT
+    // RWDT (RTC watchdog на boot, таймаут ~2 с): штатный контекст HAL.
+    wdt_hal_context_t rwdt = RWDT_HAL_CONTEXT_DEFAULT();
+    wdt_hal_disable(&rwdt);
+    LOGP("[BOOT] hardware watchdogs disabled: RWDT enabled=%d, MWDT self-unsub=%d\n",
+         (int)wdt_hal_is_enabled(&rwdt), (int)e1);
 }
 
 void setup() {
@@ -750,6 +803,22 @@ void setup() {
     //    lwIP живут на core 1, esp_wifi на core 0; прикладные задачи закреплены
     //    за core 0 (см. выше). Дамп [CORE] позволяет это проверить в логе.
     dumpTaskCoreAffinity();
+
+    // 6. FW 0.6.14 (boot-loop fix): финальный маркер + якорь + снятие собак.
+    // Лог 0.6.13: строка "[BOOT] setup complete" печаталась (из конца
+    // startNetworkStack), затем ~1..2 с тишины и SW_CPU_RESET; "last step"
+    // при этом всегда =6 — т.е. ни одна NVS-запись после wifi begin не
+    // доживала до следующего старта. Виновник — аппаратный watchdog:
+    // Arduino-core включает INT_WDT/RWDT на boot (~2 с) и кормит их только
+    // во время Wi-Fi-вызовов; после окончания сетевой инициализации собака
+    // висит на idle/core0 и валит систему ровно через ~2 с после «survived
+    // to loop()». diag_step теперь доживает до 12/14 (маркеры пишутся в
+    // самом конце setup, перед возможным срабатыванием собаки), а
+    // disableHardwareWatchdogs() убирает саму причину сброса.
+    dbgStepMark(12);
+    LOGP("[BOOT] setup complete, survived to loop()\n");
+    nvs_anchor_setup_ok();     // raw-якорь FW_VERSION — переживает WDT-сброс
+    disableHardwareWatchdogs();
 }
 
 void loop() {
