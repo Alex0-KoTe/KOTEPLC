@@ -341,7 +341,12 @@ static void startNetworkStack() {
     // (диагностика further бисектится опцией NET_LOOP_MARK_EVERY_MS).
     // FW 0.6.13 (boot-loop bisect): промежуточный «маркер выживания» после
     // сетевой инициализации. Финальный маркер + снятие аппаратных watchdog'ов
-    // — в конце setup() (см. шаг 6 там же, FW 0.6.14).
+    // — в конце setup() (см. шаг 6/7 там же).
+    // FW 0.6.15 (bisect по логу 0.6.14): сброс приходит УЖЕ ПОСЛЕ печати
+    // строки ниже («network init survived», следующий boot = SW_CPU_RESET при
+    // last step=6). Значит виновник живёт строго между этой меткой и концом
+    // setup(): web::start(), RS485, старт задач или финализация. Маркер 12
+    // пишется в NVS ДО печати — теперь его дожитие проверяемо на boot.
     dbgStepMark(12);
     LOGP("[BOOT] network init survived, continuing setup()\n");
 }
@@ -582,8 +587,10 @@ static const char *dbgStepName(int s) {
         case 9:  return "tcpip core primed (0.6.11; legacy: netboot START)";
         case 10: return "Wi-Fi RADIO START (крах внутри WiFi.mode/softAP!)";
         case 11: return "softAP done (legacy)";
-        case 12: return "setup complete, survived to loop (0.6.13)";
+        case 12: return "network init survived / setup tail (0.6.13+)";
         case 13: return "loop() alive (0.6.13, NET_LOOP_MARK_EVERY_MS)";
+        case 14: return "web server begin done (0.6.15 bisect)";
+        case 15: return "before app tasks start (0.6.15 bisect)";
         default: return "?";
     }
 }
@@ -779,6 +786,9 @@ void setup() {
 #endif
 
     // 3. Прикладные FreeRTOS-задачи
+    // FW 0.6.15 (bisect): маркер 15 — точка между web::start() и созданием
+    // задач; вместе с 14 даёт трёхточечную бисекцию пост-сетевого окна.
+    dbgStepMark(15);
     heartbeatTask.start(os::TaskBase::Config{"hb", 3072, tskIDLE_PRIORITY + 1, 0});
     appLogicTask.start(os::TaskBase::Config{"app", 3072, tskIDLE_PRIORITY + 2, 0});
     fsLogTask.start(os::TaskBase::Config{"fslog", 4096, tskIDLE_PRIORITY + 1, 0});
@@ -798,6 +808,13 @@ void setup() {
     // «прогрет» (netif поднят, tcpip_thread живёт), loopTask уже работает —
     // listen-портоваться безопасно. Функция идемпотентна (s_started).
     web::start();
+    // FW 0.6.15 (bisect): маркер 14 СРАЗУ после web::start(). Лог 0.6.14:
+    // сброс пришёл в окне между «network init survived» и концом setup(),
+    // а «last step» на boot остался 6 — т.е. ни одна NVS-запись окна не
+    // доживала. Если при следующем boot будет last step=14 — web::start()
+    // прошёл, виновник дальше (задачи/финализация); если снова 6/12 —
+    // крах внутри самого s_server.begin()/AsyncTCP.
+    dbgStepMark(14);
 
     // 5. 0.6.8: диагностика раскладки по ядрам — штатно loopTask/AsyncTCP/
     //    lwIP живут на core 1, esp_wifi на core 0; прикладные задачи закреплены
@@ -815,10 +832,16 @@ void setup() {
     // to loop()». diag_step теперь доживает до 12/14 (маркеры пишутся в
     // самом конце setup, перед возможным срабатыванием собаки), а
     // disableHardwareWatchdogs() убирает саму причину сброса.
-    dbgStepMark(12);
-    LOGP("[BOOT] setup complete, survived to loop()\n");
-    nvs_anchor_setup_ok();     // raw-якорь FW_VERSION — переживает WDT-сброс
+    // FW 0.6.15: ПОРЯДОК ИЗМЕНЁН — снятие аппаратных watchdog'ов идёт
+    // ПЕРВЫМ, до любых записей в NVS. Запись diag_step/якоря выполняется
+    // через SPI-flash (erase/write), во время которого прерывания
+    // маскируются: если RTC-собака ещё активна, именно эти записи не дают
+    // ей дожить до disableHardwareWatchdogs() (лог 0.6.14: «setup
+    // complete» так и не была напечатана, сброс — сразу после web::start).
     disableHardwareWatchdogs();
+    dbgStepMark(12);           // теперь доживает до следующего boot
+    nvs_anchor_setup_ok();     // raw-якорь FW_VERSION — переживает WDT-сброс
+    LOGP("[BOOT] setup complete, survived to loop()\n");
 }
 
 void loop() {
