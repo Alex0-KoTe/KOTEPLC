@@ -698,6 +698,7 @@ static const char *dbgStepName(int s) {
         case 13: return "loop() alive (0.6.13, NET_LOOP_MARK_EVERY_MS)";
         case 14: return "web server begin done (0.6.15 bisect)";
         case 15: return "before app tasks start (0.6.15 bisect)";
+        case 16: return "right before web::start() (0.6.19 bisect; крах внутри s_server.begin(), если step=16)";
         default: return "?";
     }
 }
@@ -945,9 +946,18 @@ void setup() {
     nvs_anchor_setup_ok();
     LOGP("[BOOT] EXPERIMENT=2: tasks started, NO web::start(); anchor+step12 written.\n");
     LOGP("[BOOT] Survived >30s -> culprit is web::start(); reset -> a task (see last step).\n");
+    // FW 0.6.19: exp2 теперь НЕ делает return раньше времени — дальше по
+    // обычному пути setup() дойдут initRs485Channel() и web::start(), а
+    // задачи уже запущены (idempotent start). Это ровно полный путь, но с
+    // маркерами 12/14/15 вокруг web::start(): «last step» на следующем boot
+    // укажет точное окно сброса (12=между финализацией exp2 и RS485,
+    // 15=внутри web::start()/AsyncTCP, 14=после веба).
 #endif
+#if BOOT_MINIMAL_EXPERIMENT == 1
     return;
 #endif
+#endif  // BOOT_MINIMAL_EXPERIMENT && <= 2 (FW 0.6.19: exp2 больше не выходит
+        // из setup() раньше времени — продолжает полный путь до web::start())
 #if RS485_INIT_AFTER_WIFI
     // 1e. Канал RS485: UART1 + RE/DE (конфигурация — rs485_config.h).
     //     ИНИЦИАЛИЗИРУЕТСЯ ПОСЛЕ Wi-Fi (см. комментарий выше): драйвер
@@ -996,6 +1006,10 @@ void setup() {
     // блокировки ядра TCP/IP (см. startNetworkStack). Теперь радио-стек
     // «прогрет» (netif поднят, tcpip_thread живёт), loopTask уже работает —
     // listen-портоваться безопасно. Функция идемпотентна (s_started).
+    // FW 0.6.19 (bisect): маркер 16 ПЕРЕД web::start() — если при следующем
+    // boot будет last step=16, сброс происходит ВНУТРИ s_server.begin()
+    // (AsyncTCP/lwIP listen); маркер 14 после — веб пройден.
+    dbgStepMark(16);
     web::start();
     // FW 0.6.15 (bisect): маркер 14 СРАЗУ после web::start(). Лог 0.6.14:
     // сброс пришёл в окне между «network init survived» и концом setup(),
